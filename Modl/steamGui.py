@@ -1,10 +1,14 @@
 import sys
 import requests
 import webbrowser
+import os
+import shutil
 
-from PyQt6.QtCore import Qt, QTimer
+from steamCmd import (SteamCMDWorker)
+from PyQt6.QtCore import Qt, QTimer, QThread,QSettings
 from PyQt6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -22,6 +26,7 @@ session.headers.update({
 
 from Steam_api import (search_workshop,get_workshop_mods
                       )
+
 
 
 def search_games(query):
@@ -57,6 +62,18 @@ class SteamSearchUI(QWidget):
     def __init__(self):
         super().__init__()
 
+        self.settings = QSettings("SBSH", "SteamWorkshopLauncher")
+
+        self.steamcmd_path = self.settings.value(
+            "steamcmd_path",
+            r"G:\SteamCMD\steamcmd.exe"
+        )
+
+        self.mods_folder = self.settings.value(
+            "mods_folder",
+            ""
+        )
+
         self.setWindowTitle("Steam Workshop Launcher")
         self.resize(1000, 600)
 
@@ -66,7 +83,23 @@ class SteamSearchUI(QWidget):
         self.mod_query = ""
 
         root_layout = QVBoxLayout()
+        self.path_button = QPushButton("Выбрать SteamCMD")
+        root_layout.addWidget(self.path_button)
+        
+        self.path_button.clicked.connect(self.select_steamcmd)
+        # Поле для папки модов
+        self.mods_path_input = QLineEdit()
+        self.mods_path_input.setPlaceholderText("Папка для скачивания модов")
+        self.mods_path_input.setText(self.mods_folder)
+        # Кнопка выбора папки
+        self.mods_path_button = QPushButton("Выбрать папку для модов")
 
+        root_layout.addWidget(self.mods_path_input)
+        root_layout.addWidget(self.mods_path_button)
+
+        self.mods_path_button.clicked.connect(self.select_mods_folder)
+        self.mods_path_input.editingFinished.connect(self.save_mods_folder)
+       
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Введите название игры...")
 
@@ -218,30 +251,118 @@ class SteamSearchUI(QWidget):
 
     def download_selected_mod(self):
         if not self.current_mod:
-            QMessageBox.warning(self, "Ошибка", "Выберите мод")
             return
+        self.download_thread = QThread()
 
-        modid = self.current_mod["id"]
+        self.download_worker = SteamCMDWorker(
+            self.steamcmd_path,
+            self.current_appid,
+            self.current_mod["id"]
+            )
 
-        print(
-            "Скачать мод:",
-            modid,
-            "appid:",
-            self.current_appid
+        self.download_worker.moveToThread(self.download_thread)
+
+        self.download_thread.started.connect(
+            self.download_worker.run
+            )
+
+
+        self.download_worker.output.connect(print)
+
+        self.download_worker.finished.connect(
+            self.download_finished
         )
 
-        # SteamCMD потом сюда:
-        # subprocess.run([
-        #   "steamcmd",
-        #   "+login", "anonymous",
-        #   "+workshop_download_item",
-        #   str(self.current_appid),
-        #   str(modid),
-        #   "+quit"
-        # ])
+        self.download_worker.error.connect(print)
 
+        self.download_worker.finished.connect(
+            self.download_thread.quit
+        )
+
+        self.download_worker.finished.connect(
+            self.download_worker.deleteLater
+        )
+
+        self.download_thread.finished.connect(
+            self.download_thread.deleteLater
+        )
+
+        self.download_thread.start()
         
+    def download_finished(self, code):
+        if code != 0:
+            QMessageBox.warning(
+                self,
+                "Ошибка",
+                "Не удалось скачать мод."
+            )
+            return
 
+        source = os.path.join(
+            os.path.dirname(self.steamcmd_path),
+            "steamapps",
+            "workshop",
+            "content",
+            str(self.current_appid),
+            str(self.current_mod["id"])
+        )
+
+        destination = os.path.join(
+            self.mods_folder,
+            str(self.current_mod["id"])
+        )
+
+        shutil.copytree(
+            source,
+            destination,
+            dirs_exist_ok=True
+        )
+
+        QMessageBox.information(
+            self,
+            "Готово",
+            "Мод успешно скачан."
+        )
+             
+    def select_steamcmd(self):
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выберите steamcmd.exe",
+            "",
+            "SteamCMD (steamcmd.exe);;Executable (*.exe)"
+        )
+
+        if filename:
+            self.steamcmd_path = filename
+
+            self.settings.setValue(
+                "steamcmd_path",
+                filename
+            )
+
+            QMessageBox.information(
+                self,
+                "Готово",
+                "Путь сохранён."
+            )
+    
+    def select_mods_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Выберите папку для модов",
+            self.mods_folder
+        )
+
+        if folder:
+            self.mods_folder = folder
+            self.mods_path_input.setText(folder)
+            self.settings.setValue("mods_folder", folder)
+
+
+    def save_mods_folder(self):
+        self.mods_folder = self.mods_path_input.text().strip()
+        self.settings.setValue("mods_folder", self.mods_folder)
+                
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
@@ -249,6 +370,4 @@ if __name__ == "__main__":
     window.show()
 
     sys.exit(app.exec())
-    
-    
     
