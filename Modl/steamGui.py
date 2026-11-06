@@ -24,8 +24,7 @@ session.headers.update({
     "User-Agent": "Mozzila/5.0"
 })
 
-from Steam_api import (search_workshop,get_workshop_mods
-                      )
+from Steam_api import (search_workshop,get_workshop_mods)
 
 
 

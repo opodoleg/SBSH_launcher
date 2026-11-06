@@ -101,14 +101,15 @@ def search_workshop(appid: int, query: str):
     url = "https://steamcommunity.com/workshop/browse/"
 
     params = {
-        "appid": appid,
-        "searchtext": query,
-        "browsefilter": "trend",
-        "browsesort": "trend",
-        "section": "items",
-        "actualsort": "trend",
-        "p": 1
+    "appid": appid,
+    "searchtext": query,
+    "section": "items",
+    "browsesort": "trend",
+    "browsefilter": "trend",
+    "actualsort": "trend",
+    "p": 1
     }
+    
 
     r = session.get(
         url,
