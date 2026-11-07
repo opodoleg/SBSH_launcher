@@ -1,5 +1,6 @@
-from PyQt6.QtCore import QObject, pyqtSignal
+import os
 import subprocess
+from PyQt6.QtCore import QObject, pyqtSignal
 
 
 class SteamCMDWorker(QObject):
@@ -7,16 +8,25 @@ class SteamCMDWorker(QObject):
     output = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, steamcmd_path, appid, modid):
+    def __init__(self, steamcmd_path: str, appid: int | str, modid: int | str):
         super().__init__()
-
         self.steamcmd_path = steamcmd_path
         self.appid = str(appid)
         self.modid = str(modid)
+        self._process = None
+        self._is_cancelled = False
 
     def run(self):
+        """Запускает загрузку мода через SteamCMD."""
         try:
-            process = subprocess.Popen(
+            if not self.steamcmd_path or not os.path.isfile(self.steamcmd_path):
+                raise FileNotFoundError(
+                    f"Исполняемый файл SteamCMD не найден: '{self.steamcmd_path}'"
+                )
+
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+            self._process = subprocess.Popen(
                 [
                     self.steamcmd_path,
                     "+login", "anonymous",
@@ -27,15 +37,33 @@ class SteamCMDWorker(QObject):
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags
             )
 
-            for line in process.stdout:
-                self.output.emit(line.rstrip())
+            if self._process.stdout:
+                for line in self._process.stdout:
+                    if self._is_cancelled:
+                        break
+                    self.output.emit(line.rstrip())
 
-            process.wait()
-
-            self.finished.emit(process.returncode)
+            self._process.wait()
+            returncode = self._process.returncode if not self._is_cancelled else -1
+            self.finished.emit(returncode)
 
         except Exception as e:
             self.error.emit(str(e))
+            self.finished.emit(-1)
+        finally:
+            self._process = None
+
+    def cancel(self):
+        """Безопасно прерывает процесс скачивания."""
+        self._is_cancelled = True
+        if self._process:
+            try:
+                self._process.terminate()
+            except Exception:
+                pass
