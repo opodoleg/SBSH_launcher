@@ -230,7 +230,7 @@ def parse_cookie_string(raw_str: str) -> Dict[str, str]:
     return result
 
 
-def get_nexus_cookies_and_session() -> Tuple[requests.Session, Dict[str, str]]:
+def get_nexus_cookies_and_session() -> Tuple[requests.Session, Dict[str, str], str]:
     """
     Автоматическое получение кук для nexusmods.com по образцу search.py.
     1. Использует browser_cookie3 для извлечения кук домена .nexusmods.com.
@@ -241,46 +241,52 @@ def get_nexus_cookies_and_session() -> Tuple[requests.Session, Dict[str, str]]:
        - cf_clearance
        - __cf_bm
     3. Если browser_cookie3 не смог прочитать базу браузера, берёт куки из NEXUS_COOKIES в .env.
-    4. Передаёт словарь кук в curl_cffi.requests.Session(impersonate="chrome").
-    Возвращает кортеж (session, cookies_dict).
+    4. Определяет подходящий профиль impersonate для curl_cffi в соответствии с браузером кук
+       (например, 'firefox133' для Firefox или 'chrome124' для Chromium/Edge/Brave).
+    Возвращает кортеж (session, cookies_dict, impersonate_profile).
     """
     cookies_dict: Dict[str, str] = {}
+    source_browser: str = "chrome"
 
     print("1. Пытаюсь автоматически подтянуть куки из браузеров...")
     raw_cookies: Dict[str, str] = {}
 
-    # 1. Попытка общего вызова browser_cookie3.load
-    try:
-        cj = browser_cookie3.load(domain_name="nexusmods.com")
-        raw_cookies = {c.name: c.value for c in cj}
-    except Exception as e:
-        # Если общий load упал (например, из-за прав админа на Edge), перебираем браузеры по отдельности
-        loaders = [
-            ("firefox", getattr(browser_cookie3, "firefox", None)),
-            ("chrome", getattr(browser_cookie3, "chrome", None)),
-            ("edge", getattr(browser_cookie3, "edge", None)),
-            ("opera", getattr(browser_cookie3, "opera", None)),
-            ("brave", getattr(browser_cookie3, "brave", None)),
-            ("vivaldi", getattr(browser_cookie3, "vivaldi", None)),
-            ("chromium", getattr(browser_cookie3, "chromium", None)),
-        ]
-        for b_name, loader in loaders:
-            if not loader:
-                continue
-            try:
-                cj = loader(domain_name="nexusmods.com")
-                for c in cj:
-                    raw_cookies[c.name] = c.value
-                if raw_cookies:
-                    break
-            except Exception:
-                continue
+    # Перебираем браузеры по отдельности
+    loaders = [
+        ("firefox", getattr(browser_cookie3, "firefox", None)),
+        ("chrome", getattr(browser_cookie3, "chrome", None)),
+        ("edge", getattr(browser_cookie3, "edge", None)),
+        ("brave", getattr(browser_cookie3, "brave", None)),
+        ("opera", getattr(browser_cookie3, "opera", None)),
+        ("vivaldi", getattr(browser_cookie3, "vivaldi", None)),
+        ("chromium", getattr(browser_cookie3, "chromium", None)),
+    ]
+    for b_name, loader in loaders:
+        if not loader:
+            continue
+        try:
+            cj = loader(domain_name="nexusmods.com")
+            b_cookies = {c.name: c.value for c in cj}
+            if any(k in b_cookies for k in TARGET_COOKIE_KEYS):
+                raw_cookies = b_cookies
+                source_browser = b_name
+                break
+        except Exception:
+            continue
+
+    if not raw_cookies:
+        # Попытка общего вызова если одиночные не вернули
+        try:
+            cj = browser_cookie3.load(domain_name="nexusmods.com")
+            raw_cookies = {c.name: c.value for c in cj}
+        except Exception:
+            pass
 
     if raw_cookies:
         # Фильтруем строго 5 целевых ключей
         cookies_dict = {k: v for k, v in raw_cookies.items() if k in TARGET_COOKIE_KEYS}
         if cookies_dict:
-            print(f"   [Успех] Куки из браузера успешно подхвачены! (найдено {len(cookies_dict)} из {len(TARGET_COOKIE_KEYS)})")
+            print(f"   [Успех] Куки из браузера ({source_browser}) успешно подхвачены! (найдено {len(cookies_dict)} из {len(TARGET_COOKIE_KEYS)})")
         else:
             print("   [!] Браузер прочитан, но целевые куки Nexus Mods не найдены.")
     else:
@@ -300,15 +306,16 @@ def get_nexus_cookies_and_session() -> Tuple[requests.Session, Dict[str, str]]:
         else:
             print("   [Ошибка] В файле .env не найдена переменная NEXUS_COOKIES!")
 
-    # 3. Инициализация сессии curl_cffi с Chrome impersonation и передача кук
-    session = requests.Session(impersonate="chrome")
-    user_agent = os.getenv("USER_AGENT") or (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
+    # 3. Подбираем impersonate под найденный браузер (чтобы Cloudflare не блокировал из-за несоответствия TLS и cf_clearance)
+    if source_browser == "firefox":
+        impersonate_target = "firefox133"
+    elif source_browser == "edge":
+        impersonate_target = "edge101"
+    else:
+        impersonate_target = "chrome124"
+
+    session = requests.Session(impersonate=impersonate_target)
     session.headers.update({
-        "User-Agent": user_agent,
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     })
@@ -316,7 +323,7 @@ def get_nexus_cookies_and_session() -> Tuple[requests.Session, Dict[str, str]]:
     if cookies_dict:
         session.cookies.update(cookies_dict)
 
-    return session, cookies_dict
+    return session, cookies_dict, impersonate_target
 
 
 class NexusAPI:
@@ -332,18 +339,13 @@ class NexusAPI:
         self._lock = threading.RLock()
 
         # Автоматическое получение кук и инициализация сессии
-        self.session, self.cookies = get_nexus_cookies_and_session()
+        self.session, self.cookies, self.impersonate = get_nexus_cookies_and_session()
 
     def create_session(self) -> requests.Session:
         """Создает новый независимый поток-локальный экземпляр сессии curl_cffi с куками."""
-        s = requests.Session(impersonate="chrome")
-        user_agent = os.getenv("USER_AGENT") or (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
+        imp = getattr(self, "impersonate", "chrome124") or "chrome124"
+        s = requests.Session(impersonate=imp)
         s.headers.update({
-            "User-Agent": user_agent,
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         })
