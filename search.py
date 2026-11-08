@@ -7,8 +7,12 @@ import browser_cookie3
 import requests
 from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi_requests
+import sys
 from dotenv import load_dotenv
 
+if getattr(sys, 'frozen', False):
+    exe_dir = os.path.dirname(sys.executable)
+    load_dotenv(os.path.join(exe_dir, '.env'))
 load_dotenv()
 
 # Путь по умолчанию для загрузки игр/файлов (можно переопределить через .env TORRENT_SAVE_PATH)

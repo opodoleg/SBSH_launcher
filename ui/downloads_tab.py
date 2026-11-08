@@ -2,6 +2,7 @@ import os
 import sys
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
@@ -11,12 +12,23 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import requests
+from modules.download_queue import (
+    DownloadTask,
+    STATE_CANCELLED,
+    STATE_COMPLETED,
+    STATE_DOWNLOADING,
+    STATE_ERROR,
+    STATE_GENERATING_URL,
+    STATE_QUEUED,
+    get_download_queue_manager,
+)
 
 
 def format_bytes(size_bytes: int) -> str:
@@ -54,6 +66,15 @@ STATE_TRANSLATIONS = {
     "missingFiles": "Файлы отсутствуют",
 }
 
+STATUS_COLORS = {
+    STATE_QUEUED: "#f59e0b",          # янтарный
+    STATE_GENERATING_URL: "#38bdf8",  # небесный
+    STATE_DOWNLOADING: "#60a5fa",     # ярко-синий
+    STATE_COMPLETED: "#22c55e",       # изумрудный
+    STATE_ERROR: "#ef4444",           # красный
+    STATE_CANCELLED: "#64748b",       # приглушенный серый
+}
+
 
 class QBTFetchWorker(QThread):
     torrents_fetched = pyqtSignal(list)
@@ -76,22 +97,400 @@ class QBTFetchWorker(QThread):
 
 
 class DownloadsTabWidget(QWidget):
-    """Вкладка мониторинга активных загрузок в qBittorrent."""
+    """
+    Вкладка загрузок лаунчера.
+    Содержит две подвкладки:
+    1. Очередь загрузки модов (Steam Workshop & Nexus Mods)
+    2. Загрузки игр через qBittorrent
+    """
 
-    def __init__(self, get_qb_url_callback=None):
+    def __init__(self, get_qb_url_callback=None, get_mods_folder_callback=None):
         super().__init__()
         self.get_qb_url_callback = get_qb_url_callback
+        self.get_mods_folder_callback = get_mods_folder_callback
+
+        # Состояние qBittorrent
         self.current_torrents = []
         self.selected_hash = None
         self.fetch_worker = None
 
+        # Менеджер очереди загрузки модов
+        self.queue_manager = get_download_queue_manager()
+
         self._setup_ui()
-        self._setup_timer()
+        self._setup_queue_signals()
+        self._setup_torrents_timer()
+
+        # Первичное заполнение таблицы модов из очереди
+        self.refresh_mods_table()
 
     def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(16, 16, 16, 16)
+        root_layout = QVBoxLayout(self)
+        root_layout.setSpacing(8)
+        root_layout.setContentsMargins(12, 12, 12, 12)
+
+        self.sub_tabs = QTabWidget()
+        self.sub_tabs.setDocumentMode(True)
+
+        # 1. Вкладка "Очередь модов"
+        self.mods_tab = QWidget()
+        self._setup_mods_ui(self.mods_tab)
+        self.sub_tabs.addTab(self.mods_tab, "📦  Моды (Steam & Nexus Mods)")
+
+        # 2. Вкладка "Торренты игр"
+        self.torrents_tab = QWidget()
+        self._setup_torrents_ui(self.torrents_tab)
+        self.sub_tabs.addTab(self.torrents_tab, "🎮  Игры (qBittorrent)")
+
+        root_layout.addWidget(self.sub_tabs)
+
+    # =========================================================================
+    # ПОДВКЛАДКА 1: ОЧЕРЕДЬ ЗАГРУЗКИ МОДОВ
+    # =========================================================================
+
+    def _setup_mods_ui(self, parent_widget: QWidget):
+        layout = QVBoxLayout(parent_widget)
+        layout.setSpacing(10)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        # Верхняя панель управления очередью модов
+        top_bar = QHBoxLayout()
+        title_label = QLabel("<b>Очередь скачивания модов:</b>")
+        title_label.setStyleSheet("font-size: 14px; color: #38bdf8;")
+
+        self.mods_active_badge = QLabel("Очередь пуста")
+        self.mods_active_badge.setStyleSheet(
+            "background-color: #1e293b; color: #94a3b8; padding: 3px 8px; "
+            "border-radius: 10px; font-size: 11px; font-weight: bold;"
+        )
+
+        top_bar.addWidget(title_label)
+        top_bar.addWidget(self.mods_active_badge)
+        top_bar.addStretch(1)
+
+        self.cancel_mod_btn = QPushButton("❌ Отменить / Удалить из очереди")
+        self.cancel_mod_btn.setObjectName("secondaryBtn")
+        self.cancel_mod_btn.setEnabled(False)
+        self.cancel_mod_btn.setToolTip("Отменить выбранную загрузку или убрать её из очереди")
+        self.cancel_mod_btn.clicked.connect(self.cancel_selected_mod)
+
+        self.clear_completed_btn = QPushButton("🧹 Очистить завершённые")
+        self.clear_completed_btn.setObjectName("secondaryBtn")
+        self.clear_completed_btn.setToolTip("Удалить из списка завершённые, ошибочные и отменённые загрузки")
+        self.clear_completed_btn.clicked.connect(self.clear_completed_mods)
+
+        self.open_mods_folder_btn = QPushButton("📁 Папка модов")
+        self.open_mods_folder_btn.setObjectName("secondaryBtn")
+        self.open_mods_folder_btn.setToolTip("Открыть папку, куда сохраняются скачанные моды")
+        self.open_mods_folder_btn.clicked.connect(self.open_mods_folder)
+
+        top_bar.addWidget(self.cancel_mod_btn)
+        top_bar.addWidget(self.clear_completed_btn)
+        top_bar.addWidget(self.open_mods_folder_btn)
+        layout.addLayout(top_bar)
+
+        # Таблица очереди модов
+        self.mods_table = QTableWidget()
+        self.mods_table.setColumnCount(8)
+        self.mods_table.setHorizontalHeaderLabels([
+            "ID",
+            "Мод",
+            "Файл",
+            "Источник",
+            "Размер",
+            "Прогресс",
+            "Скорость",
+            "Статус",
+        ])
+        self.mods_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.mods_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.mods_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.mods_table.verticalHeader().setVisible(False)
+
+        header = self.mods_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.mods_table.setColumnWidth(5, 170)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+
+        self.mods_table.itemSelectionChanged.connect(self._on_mod_selection_changed)
+        self.mods_table.cellDoubleClicked.connect(self._on_mod_double_clicked)
+        layout.addWidget(self.mods_table)
+
+        # Нижняя информационная строка
+        self.mods_status_label = QLabel("Очередь готова к приёму модов")
+        self.mods_status_label.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        layout.addWidget(self.mods_status_label)
+
+    def _setup_queue_signals(self):
+        """Подключает сигналы менеджера очереди (потокобезопасно через Qt Signal/Slot)."""
+        self.queue_manager.task_added.connect(self._on_task_added)
+        self.queue_manager.task_updated.connect(self._on_task_updated)
+        self.queue_manager.task_progress.connect(self._on_task_progress)
+        self.queue_manager.task_finished.connect(self._on_task_finished)
+        self.queue_manager.queue_cleared.connect(self._on_queue_cleared)
+        self.queue_manager.active_count_changed.connect(self._on_active_count_changed)
+
+    def refresh_mods_table(self):
+        """Полная перерисовка таблицы модов."""
+        tasks = self.queue_manager.get_all_tasks()
+        selected_task_id = self._get_selected_task_id()
+
+        self.mods_table.setRowCount(len(tasks))
+        restore_row = -1
+
+        for row, task in enumerate(tasks):
+            if selected_task_id and task.task_id == selected_task_id:
+                restore_row = row
+            self._render_task_row(row, task)
+
+        if restore_row >= 0:
+            self.mods_table.selectRow(restore_row)
+
+        self._update_mods_badge(len(tasks))
+
+    def _get_row_by_task_id(self, task_id: int) -> int:
+        for row in range(self.mods_table.rowCount()):
+            item = self.mods_table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == task_id:
+                return row
+        return -1
+
+    def _get_selected_task_id(self) -> Optional[int]:
+        row = self.mods_table.currentRow()
+        if 0 <= row < self.mods_table.rowCount():
+            item = self.mods_table.item(row, 0)
+            if item:
+                return item.data(Qt.ItemDataRole.UserRole)
+        return None
+
+    def _render_task_row(self, row: int, task: DownloadTask):
+        # 0. ID
+        id_item = QTableWidgetItem(f"#{task.task_id}")
+        id_item.setData(Qt.ItemDataRole.UserRole, task.task_id)
+        id_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.mods_table.setItem(row, 0, id_item)
+
+        # 1. Название мода
+        title_item = QTableWidgetItem(task.title)
+        self.mods_table.setItem(row, 1, title_item)
+
+        # 2. Файл
+        file_item = QTableWidgetItem(task.file_name)
+        self.mods_table.setItem(row, 2, file_item)
+
+        # 3. Источник
+        src_label = "⚡ Nexus Mods" if task.source == "nexus" else "🌐 Steam"
+        src_item = QTableWidgetItem(src_label)
+        src_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.mods_table.setItem(row, 3, src_item)
+
+        # 4. Размер
+        size_item = QTableWidgetItem(task.size_human or "—")
+        size_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.mods_table.setItem(row, 4, size_item)
+
+        # 5. Прогресс-бар
+        pbar = self.mods_table.cellWidget(row, 5)
+        if not isinstance(pbar, QProgressBar):
+            pbar = QProgressBar()
+            pbar.setRange(0, 100)
+            pbar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.mods_table.setCellWidget(row, 5, pbar)
+
+        pbar.setValue(task.progress)
+        pbar.setFormat(f"{task.progress}%")
+
+        # 6. Скорость
+        speed_item = QTableWidgetItem(task.speed_str or "—")
+        speed_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        if task.status == STATE_DOWNLOADING and task.speed_str not in ["—", "0 Б/с"]:
+            speed_item.setForeground(QColor("#22c55e"))
+        self.mods_table.setItem(row, 6, speed_item)
+
+        # 7. Статус
+        state_item = QTableWidgetItem(task.status_text)
+        state_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        color = STATUS_COLORS.get(task.status, "#e2e8f0")
+        state_item.setForeground(QColor(color))
+
+        if task.status == STATE_ERROR and task.error_message:
+            state_item.setToolTip(f"Ошибка:\n{task.error_message}")
+        elif task.status == STATE_COMPLETED and task.saved_path:
+            state_item.setToolTip(f"Сохранено в:\n{task.saved_path}")
+
+        self.mods_table.setItem(row, 7, state_item)
+
+    def _on_task_added(self, task: DownloadTask):
+        row = self.mods_table.rowCount()
+        self.mods_table.insertRow(row)
+        self._render_task_row(row, task)
+        self._update_mods_badge()
+        self.mods_status_label.setText(f"Мод '{task.title}' добавлен в очередь загрузок (#{task.task_id})")
+
+    def _on_task_updated(self, task: DownloadTask):
+        row = self._get_row_by_task_id(task.task_id)
+        if row >= 0:
+            self._render_task_row(row, task)
+            self._on_mod_selection_changed()
+        else:
+            self.refresh_mods_table()
+
+    def _on_task_progress(self, task_id: int, downloaded: int, total: int, speed: str):
+        row = self._get_row_by_task_id(task_id)
+        if row >= 0:
+            task = self.queue_manager.get_task(task_id)
+            if task:
+                pbar = self.mods_table.cellWidget(row, 5)
+                if isinstance(pbar, QProgressBar):
+                    pbar.setValue(task.progress)
+                    pbar.setFormat(f"{task.progress}%")
+
+                speed_item = self.mods_table.item(row, 6)
+                if speed_item:
+                    speed_item.setText(speed)
+                    if speed != "—":
+                        speed_item.setForeground(QColor("#22c55e"))
+
+                status_item = self.mods_table.item(row, 7)
+                if status_item:
+                    status_item.setText(task.status_text)
+
+    def _on_task_finished(self, task_id: int, is_success: bool, path_or_error: str):
+        row = self._get_row_by_task_id(task_id)
+        if row >= 0:
+            task = self.queue_manager.get_task(task_id)
+            if task:
+                self._render_task_row(row, task)
+
+        self._update_mods_badge()
+        task = self.queue_manager.get_task(task_id)
+        if task:
+            if is_success:
+                self.mods_status_label.setText(f"✓ Загрузка завершена: {task.title} (#{task_id})")
+            else:
+                self.mods_status_label.setText(f"✕ Ошибка загрузки #{task_id}: {path_or_error[:80]}")
+
+    def _on_queue_cleared(self):
+        self.refresh_mods_table()
+
+    def _on_active_count_changed(self, count: int):
+        self._update_mods_badge()
+
+    def _update_mods_badge(self, total_tasks: Optional[int] = None):
+        active_count = self.queue_manager.get_active_count()
+        if total_tasks is None:
+            total_tasks = self.mods_table.rowCount()
+
+        if active_count > 0:
+            self.mods_active_badge.setText(f"● Активных: {active_count} (всего: {total_tasks})")
+            self.mods_active_badge.setStyleSheet(
+                "background-color: #164e63; color: #38bdf8; padding: 3px 8px; "
+                "border-radius: 10px; font-size: 11px; font-weight: bold;"
+            )
+        else:
+            self.mods_active_badge.setText(f"Очередь свободна (всего: {total_tasks})")
+            self.mods_active_badge.setStyleSheet(
+                "background-color: #1e293b; color: #94a3b8; padding: 3px 8px; "
+                "border-radius: 10px; font-size: 11px;"
+            )
+
+    def _on_mod_selection_changed(self):
+        task_id = self._get_selected_task_id()
+        if task_id:
+            task = self.queue_manager.get_task(task_id)
+            if task:
+                can_cancel = task.status in [STATE_QUEUED, STATE_GENERATING_URL, STATE_DOWNLOADING]
+                self.cancel_mod_btn.setEnabled(can_cancel)
+                if task.status == STATE_ERROR and task.error_message:
+                    self.mods_status_label.setText(f"Ошибка #{task.task_id}: {task.error_message}")
+                elif task.status == STATE_COMPLETED and task.saved_path:
+                    self.mods_status_label.setText(f"Сохранено: {task.saved_path}")
+                return
+        self.cancel_mod_btn.setEnabled(False)
+
+    def _on_mod_double_clicked(self, row: int, column: int):
+        task_id = self._get_selected_task_id()
+        if not task_id:
+            return
+        task = self.queue_manager.get_task(task_id)
+        if not task:
+            return
+
+        if task.status == STATE_COMPLETED and task.saved_path:
+            path = task.saved_path
+            if os.path.isfile(path):
+                folder = os.path.dirname(path)
+            else:
+                folder = path
+            if os.path.exists(folder):
+                try:
+                    os.startfile(folder)
+                except Exception:
+                    pass
+        elif task.status == STATE_ERROR and task.error_message:
+            QMessageBox.critical(
+                self,
+                f"Ошибка загрузки #{task.task_id}",
+                f"Не удалось скачать '{task.title}':\n\n{task.error_message}"
+            )
+
+    def cancel_selected_mod(self):
+        task_id = self._get_selected_task_id()
+        if not task_id:
+            return
+        task = self.queue_manager.get_task(task_id)
+        if not task:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Отмена загрузки",
+            f"Отменить загрузку мода '{task.title}' (#{task.task_id})?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.queue_manager.cancel_task(task_id)
+            self.mods_status_label.setText(f"Загрузка #{task_id} отменена пользователем.")
+
+    def clear_completed_mods(self):
+        self.queue_manager.clear_completed()
+        self.mods_status_label.setText("Завершённые и отменённые задачи удалены из списка.")
+
+    def open_mods_folder(self):
+        folder = ""
+        if self.get_mods_folder_callback:
+            folder = self.get_mods_folder_callback()
+        if not folder or not os.path.isdir(folder):
+            from PyQt6.QtCore import QSettings
+            folder = QSettings("SBSH", "SteamWorkshopLauncher").value("mods_folder", "")
+
+        if folder and os.path.exists(folder):
+            try:
+                os.startfile(folder)
+            except Exception as e:
+                QMessageBox.warning(self, "Ошибка", f"Не удалось открыть папку:\n{e}")
+        else:
+            QMessageBox.information(
+                self,
+                "Папка не найдена",
+                f"Папка модов ещё не указана или не существует:\n{folder}\n"
+                "Вы можете настроить путь во вкладке 'Настройки'."
+            )
+
+    # =========================================================================
+    # ПОДВКЛАДКА 2: QBITTORRENT (ИГРЫ)
+    # =========================================================================
+
+    def _setup_torrents_ui(self, parent_widget: QWidget):
+        layout = QVBoxLayout(parent_widget)
+        layout.setSpacing(10)
+        layout.setContentsMargins(8, 8, 8, 8)
 
         # Верхняя панель управления
         top_bar = QHBoxLayout()
@@ -153,8 +552,7 @@ class DownloadsTabWidget(QWidget):
         action_bar.addWidget(self.delete_btn)
         layout.addLayout(action_bar)
 
-    def _setup_timer(self):
-        # Автоматическое обновление списка каждые 3 секунды
+    def _setup_torrents_timer(self):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.fetch_torrents)
         self.timer.start(3000)
@@ -178,7 +576,6 @@ class DownloadsTabWidget(QWidget):
         self.current_torrents = torrents
         self.status_label.setText(f"Подключено к qBittorrent • Торрентов: {len(torrents)}")
 
-        # Сохраняем текущий выбранный хэш перед перерисовкой
         selected_row = self.table.currentRow()
         saved_hash = None
         if 0 <= selected_row < len(self.current_torrents):
@@ -195,21 +592,18 @@ class DownloadsTabWidget(QWidget):
             size_item = QTableWidgetItem(format_bytes(t.get("size", 0)))
             size_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            # Прогресс бар
             progress_val = int((t.get("progress", 0.0)) * 100)
             pbar = QProgressBar()
             pbar.setValue(progress_val)
             pbar.setFormat(f"{progress_val}%")
 
-            # Скорость
             dlspeed = t.get("dlspeed", 0)
             speed_str = format_speed(dlspeed)
             speed_item = QTableWidgetItem(speed_str)
             speed_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             if dlspeed > 0:
-                speed_item.setForeground(Qt.GlobalColor.green)
+                speed_item.setForeground(QColor("#22c55e"))
 
-            # Статус
             raw_state = t.get("state", "unknown")
             state_text = STATE_TRANSLATIONS.get(raw_state, raw_state)
             state_item = QTableWidgetItem(state_text)

@@ -25,6 +25,7 @@ from search import (
     RuTrackerParser,
     add_to_qbittorrent,
 )
+from modules.favorites import favorites_manager
 
 
 class RuTrackerSearchWorker(QThread):
@@ -91,7 +92,8 @@ class RuTrackerDownloadWorker(QThread):
 
 class GamesTabWidget(QWidget):
     """Вкладка поиска и скачивания игр через RuTracker и qBittorrent."""
-    torrent_added = pyqtSignal()  # Сигнал для перехода или обновления монитора загрузок
+    torrent_added = pyqtSignal()      # Сигнал для перехода в монитор загрузок
+    favorites_changed = pyqtSignal()  # Сигнал при изменении избранного
 
     def __init__(self, get_save_path_callback=None):
         super().__init__()
@@ -168,6 +170,11 @@ class GamesTabWidget(QWidget):
         self.browser_button.setEnabled(False)
         self.browser_button.clicked.connect(self.open_in_browser)
 
+        self.fav_button = QPushButton("⭐ В избранное")
+        self.fav_button.setObjectName("secondaryBtn")
+        self.fav_button.setEnabled(False)
+        self.fav_button.clicked.connect(self.toggle_favorite)
+
         self.download_button = QPushButton("📥 Скачать в qBittorrent")
         self.download_button.setObjectName("accentBtn")
         self.download_button.setFixedHeight(38)
@@ -175,6 +182,7 @@ class GamesTabWidget(QWidget):
         self.download_button.clicked.connect(self.start_download)
 
         action_bar.addWidget(self.info_label, stretch=1)
+        action_bar.addWidget(self.fav_button)
         action_bar.addWidget(self.browser_button)
         action_bar.addWidget(self.download_button)
         layout.addLayout(action_bar)
@@ -268,6 +276,7 @@ class GamesTabWidget(QWidget):
         has_sel = self.selected_item is not None
         self.browser_button.setEnabled(has_sel)
         self.download_button.setEnabled(has_sel)
+        self.fav_button.setEnabled(has_sel)
 
         if has_sel:
             title = self.selected_item.get("title", "")
@@ -275,8 +284,29 @@ class GamesTabWidget(QWidget):
             self.info_label.setText(
                 f"<b>Выбрано:</b> [{forum}] {title}"
             )
+            if favorites_manager.is_favorite(name=title):
+                self.fav_button.setText("★ В избранном")
+                self.fav_button.setStyleSheet("color: #eab308; font-weight: bold;")
+            else:
+                self.fav_button.setText("⭐ В избранное")
+                self.fav_button.setStyleSheet("")
         else:
             self.info_label.setText("<i>Выберите игру из списка для скачивания.</i>")
+            self.fav_button.setText("⭐ В избранное")
+            self.fav_button.setStyleSheet("")
+
+    def toggle_favorite(self):
+        if not self.selected_item:
+            return
+        title = self.selected_item.get("title", "")
+        favorites_manager.toggle(name=title)
+        self._update_action_state()
+        self.favorites_changed.emit()
+
+    def set_search_query(self, query: str):
+        """Устанавливает запрос в строку поиска и автоматически запускает поиск."""
+        self.search_input.setText(query)
+        self.start_search()
 
     def open_in_browser(self):
         if not self.selected_item or not self.selected_item.get("url"):

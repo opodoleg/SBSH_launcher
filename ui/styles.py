@@ -264,4 +264,26 @@ QScrollBar::handle:horizontal:hover {
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
     width: 0px;
 }
+
+/* Разделители QSplitter */
+QSplitter::handle {
+    background-color: #2b2d3c;
+    width: 6px;
+    height: 6px;
+    border-radius: 3px;
+}
+
+QSplitter::handle:hover {
+    background-color: #38bdf8;
+}
+
+/* Текстовые поля и описание QTextBrowser */
+QTextBrowser, QTextEdit {
+    background-color: #171821;
+    color: #cbd5e1;
+    border: 1px solid #2e303e;
+    border-radius: 6px;
+    padding: 8px;
+    font-size: 12px;
+}
 """

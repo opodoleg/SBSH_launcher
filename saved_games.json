@@ -1,0 +1,42 @@
+[
+  {
+    "name": "Garry's Mod",
+    "appid": 4000
+  },
+  {
+    "name": "RimWorld",
+    "appid": 294100
+  },
+  {
+    "name": "Project Zomboid",
+    "appid": 108600
+  },
+  {
+    "name": "Left 4 Dead 2",
+    "appid": 550
+  },
+  {
+    "name": "Hearts of Iron IV",
+    "appid": 394360
+  },
+  {
+    "name": "People Playground",
+    "appid": 1118200
+  },
+  {
+    "name": "Cities: Skylines",
+    "appid": 255710
+  },
+  {
+    "name": "Teardown",
+    "appid": 1167630
+  },
+  {
+    "name": "Arma 3",
+    "appid": 107410
+  },
+  {
+    "name": "Terraria",
+    "appid": 105600
+  }
+]
