@@ -535,6 +535,305 @@ class NexusAPI:
             "game_id": gid,
         }]
 
+    def search_collections(
+        self,
+        query: str = "",
+        sort: str = "downloads",
+        game_id: Optional[int] = None,
+        game_domain: Optional[str] = None,
+        count: int = 25,
+    ) -> List[Dict[str, Any]]:
+        """
+        Поиск коллекций модов Nexus Mods через GraphQL CollectionsV2.
+        Возвращает список словарей с описанием коллекций:
+        - id, name, slug, summary, downloads, endorsements, tile_image, header_image,
+          user, revision_number, mod_count, total_size_bytes, total_size_human,
+          download_link, url, game_domain, game_id.
+        """
+        gid = game_id if game_id is not None else self.game_id
+        domain = game_domain or self.game_domain
+        text = (query or "").strip()
+
+        graphql_query = """
+        query SearchCollections($filter: CollectionsSearchFilter, $sort: [CollectionsSearchSort!], $count: Int) {
+          collectionsV2(filter: $filter, sort: $sort, count: $count) {
+            nodes {
+              id
+              name
+              slug
+              summary
+              totalDownloads
+              endorsements
+              tileImage {
+                url
+              }
+              headerImage {
+                url
+              }
+              user {
+                name
+                avatar
+              }
+              latestPublishedRevision {
+                revisionNumber
+                modCount
+                totalSize
+                downloadLink
+              }
+            }
+            totalCount
+          }
+        }
+        """
+
+        filter_obj: Dict[str, Any] = {
+            "gameId": {"value": str(gid), "op": "EQUALS"},
+            "hasPublishedRevision": {"value": True, "op": "EQUALS"},
+        }
+        if text:
+            filter_obj["name"] = {"value": text, "op": "WILDCARD"}
+
+        sort_map = {
+            "downloads": {"downloads": {"direction": "DESC"}},
+            "endorsements": {"endorsements": {"direction": "DESC"}},
+            "rating": {"rating": {"direction": "DESC"}},
+            "recent": {"updatedAt": {"direction": "DESC"}},
+            "new": {"createdAt": {"direction": "DESC"}},
+        }
+        sort_obj = [sort_map.get(sort, {"downloads": {"direction": "DESC"}})]
+
+        variables = {
+            "filter": filter_obj,
+            "sort": sort_obj,
+            "count": count,
+        }
+
+        with self._lock:
+            try:
+                resp = self.session.post(
+                    GRAPHQL_ENDPOINT,
+                    json={"query": graphql_query, "variables": variables},
+                    headers={"Content-Type": "application/json"},
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    nodes = data.get("data", {}).get("collectionsV2", {}).get("nodes", [])
+                    results = []
+                    for n in nodes:
+                        c_id = n.get("id")
+                        rev = n.get("latestPublishedRevision") or {}
+                        raw_size = rev.get("totalSize")
+                        try:
+                            size_int = int(raw_size) if raw_size else 0
+                        except (ValueError, TypeError):
+                            size_int = 0
+
+                        tile_img = n.get("tileImage") or {}
+                        header_img = n.get("headerImage") or {}
+                        user_obj = n.get("user") or {}
+
+                        results.append({
+                            "type": "collection",
+                            "id": c_id,
+                            "name": n.get("name", f"Collection {c_id}"),
+                            "title": n.get("name", f"Collection {c_id}"),
+                            "slug": n.get("slug", ""),
+                            "summary": n.get("summary", ""),
+                            "downloads": n.get("totalDownloads", 0),
+                            "endorsements": n.get("endorsements", 0),
+                            "tile_image": tile_img.get("url", ""),
+                            "header_image": header_img.get("url", ""),
+                            "user": user_obj.get("name", "Неизвестен"),
+                            "author": user_obj.get("name", "Неизвестен"),
+                            "user_avatar": user_obj.get("avatar", ""),
+                            "revision_number": rev.get("revisionNumber", 1),
+                            "mod_count": rev.get("modCount", 0),
+                            "total_size_bytes": size_int,
+                            "total_size_human": format_bytes(size_int),
+                            "download_link": rev.get("downloadLink", ""),
+                            "url": f"https://next.nexusmods.com/{domain}/collections/{n.get('slug', '')}",
+                            "game_domain": domain,
+                            "game_id": gid,
+                        })
+                    return results
+            except Exception as e:
+                print(f"[NexusAPI] Ошибка поиска коллекций: {e}")
+
+        return []
+
+    def get_collection_details(
+        self,
+        slug: str,
+        game_domain: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Возвращает подробные данные о коллекции и полный список файлов модов в последней опубликованной ревизии.
+        """
+        if not slug:
+            return None
+
+        domain = game_domain or self.game_domain
+
+        graphql_query = """
+        query GetCollectionBySlug($slug: String!) {
+          collection(slug: $slug) {
+            id
+            name
+            slug
+            summary
+            description
+            totalDownloads
+            endorsements
+            tileImage {
+              url
+            }
+            headerImage {
+              url
+            }
+            user {
+              name
+              avatar
+            }
+            latestPublishedRevision {
+              id
+              revisionNumber
+              modCount
+              totalSize
+              downloadLink
+              modFiles {
+                fileId
+                gameId
+                optional
+                version
+                file {
+                  id
+                  name
+                  sizeInBytes
+                  version
+                  modId
+                  mod {
+                    name
+                    pictureUrl
+                    author
+                    summary
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+
+        with self._lock:
+            try:
+                resp = self.session.post(
+                    GRAPHQL_ENDPOINT,
+                    json={"query": graphql_query, "variables": {"slug": slug}},
+                    headers={"Content-Type": "application/json"},
+                    timeout=20,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    c = data.get("data", {}).get("collection")
+                    if not c:
+                        return None
+
+                    rev = c.get("latestPublishedRevision") or {}
+                    raw_size = rev.get("totalSize")
+                    try:
+                        total_bytes = int(raw_size) if raw_size else 0
+                    except (ValueError, TypeError):
+                        total_bytes = 0
+
+                    tile_img = c.get("tileImage") or {}
+                    header_img = c.get("headerImage") or {}
+                    user_obj = c.get("user") or {}
+
+                    raw_mods = rev.get("modFiles") or []
+                    parsed_mods = []
+                    for idx, mf in enumerate(raw_mods):
+                        f_info = mf.get("file") or {}
+                        m_info = f_info.get("mod") or {}
+
+                        f_size_raw = f_info.get("sizeInBytes")
+                        try:
+                            f_size_bytes = int(f_size_raw) if f_size_raw else 0
+                        except (ValueError, TypeError):
+                            f_size_bytes = 0
+
+                        mod_id = f_info.get("modId")
+                        file_id = mf.get("fileId")
+
+                        parsed_mods.append({
+                            "index": idx + 1,
+                            "file_id": file_id,
+                            "game_id": mf.get("gameId") or self.game_id,
+                            "mod_id": mod_id,
+                            "name": f_info.get("name") or (m_info.get("name") if m_info else f"Mod {mod_id}"),
+                            "mod_name": m_info.get("name") or (f_info.get("name") if f_info else f"Mod {mod_id}"),
+                            "author": m_info.get("author") or "Неизвестен",
+                            "version": mf.get("version") or f_info.get("version") or "",
+                            "size_bytes": f_size_bytes,
+                            "size_human": format_bytes(f_size_bytes),
+                            "optional": bool(mf.get("optional", False)),
+                            "picture_url": m_info.get("pictureUrl") or "",
+                            "summary": m_info.get("summary") or "",
+                            "mod_url": f"https://www.nexusmods.com/{domain}/mods/{mod_id}" if mod_id else "",
+                        })
+
+                    return {
+                        "type": "collection",
+                        "id": c.get("id"),
+                        "slug": c.get("slug", slug),
+                        "name": c.get("name", "Без названия"),
+                        "title": c.get("name", "Без названия"),
+                        "summary": c.get("summary", ""),
+                        "description": c.get("description", ""),
+                        "downloads": c.get("totalDownloads", 0),
+                        "endorsements": c.get("endorsements", 0),
+                        "tile_image": tile_img.get("url", ""),
+                        "header_image": header_img.get("url", ""),
+                        "user": user_obj.get("name", "Неизвестен"),
+                        "author": user_obj.get("name", "Неизвестен"),
+                        "user_avatar": user_obj.get("avatar", ""),
+                        "revision_number": rev.get("revisionNumber", 1),
+                        "mod_count": rev.get("modCount", len(parsed_mods)),
+                        "total_size_bytes": total_bytes,
+                        "total_size_human": format_bytes(total_bytes),
+                        "download_link": rev.get("downloadLink", ""),
+                        "url": f"https://next.nexusmods.com/{domain}/collections/{slug}",
+                        "game_domain": domain,
+                        "mods": parsed_mods,
+                    }
+            except Exception as e:
+                print(f"[NexusAPI] Ошибка получения деталей коллекции: {e}")
+
+        return None
+
+    def get_collection_manifest_url(self, download_link: str) -> Optional[str]:
+        """
+        Запрашивает прямую CDN ссылку для скачивания файла манифеста коллекции (.7z).
+        """
+        if not download_link:
+            return None
+
+        clean_link = download_link if download_link.startswith("/") else f"/{download_link}"
+        url = f"https://api.nexusmods.com{clean_link}"
+
+        with self._lock:
+            try:
+                resp = self.session.get(url, timeout=15)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    dl_links = data.get("download_links") or []
+                    if dl_links and "URI" in dl_links[0]:
+                        return dl_links[0]["URI"]
+            except Exception as e:
+                print(f"[NexusAPI] Ошибка получения ссылки на манифест: {e}")
+
+        return None
+
     def _fallback_web_search(self, query: str, game_id: int, game_domain: str) -> List[Dict[str, Any]]:
         """Резервный парсинг HTML выдачи при сбое GraphQL."""
         with self._lock:

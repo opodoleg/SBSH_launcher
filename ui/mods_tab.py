@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QCursor, QPixmap
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -15,6 +16,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -23,6 +25,8 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QTextBrowser,
     QVBoxLayout,
@@ -543,6 +547,13 @@ class ModsTabWidget(QWidget):
         self.selected_nexus_file = None
         self.nexus_download_worker = None
 
+        # Состояние коллекций Nexus Mods
+        self.nexus_type = "mods"  # "mods" или "collections"
+        self.nexus_collection_sort = "downloads"
+        self.current_collection = None
+        self.current_collection_details = None
+        self.selected_collection_mod = None
+
         # Детали и скриншоты выбранного мода
         self.current_details = None
         self.current_screenshots = []
@@ -699,7 +710,27 @@ class ModsTabWidget(QWidget):
         self.active_game_label = QLabel("<b>Моды мастерской Steam (Workshop):</b>")
         self.active_game_label.setTextFormat(Qt.TextFormat.RichText)
 
-        # Выбор категории Nexus Mods (виден только в режиме Nexus)
+        # Переключатель типа Nexus Mods: Моды или Коллекции
+        self.nexus_type_container = QWidget()
+        nexus_type_layout = QHBoxLayout(self.nexus_type_container)
+        nexus_type_layout.setContentsMargins(0, 0, 0, 0)
+        nexus_type_layout.setSpacing(6)
+
+        self.btn_view_mods = QPushButton("📦 Одиночные моды")
+        self.btn_view_mods.setCheckable(True)
+        self.btn_view_mods.setChecked(True)
+        self.btn_view_mods.clicked.connect(lambda: self.set_nexus_type("mods"))
+
+        self.btn_view_collections = QPushButton("📚 Коллекции модов")
+        self.btn_view_collections.setCheckable(True)
+        self.btn_view_collections.setChecked(False)
+        self.btn_view_collections.clicked.connect(lambda: self.set_nexus_type("collections"))
+
+        nexus_type_layout.addWidget(self.btn_view_mods, stretch=1)
+        nexus_type_layout.addWidget(self.btn_view_collections, stretch=1)
+        self.nexus_type_container.setVisible(False)
+
+        # Выбор категории Nexus Mods (виден только в режиме Nexus -> Моды)
         self.nexus_category_row = QHBoxLayout()
         self.nexus_category_lbl = QLabel("<b>Категория:</b>")
         self.nexus_category_lbl.setStyleSheet("color: #94a3b8;")
@@ -712,6 +743,24 @@ class ModsTabWidget(QWidget):
         self.nexus_category_container.setLayout(self.nexus_category_row)
         self.nexus_category_container.setVisible(False)
 
+        # Сортировка коллекций Nexus Mods (видна только в режиме Nexus -> Коллекции)
+        self.nexus_collection_sort_container = QWidget()
+        nexus_sort_layout = QHBoxLayout(self.nexus_collection_sort_container)
+        nexus_sort_layout.setContentsMargins(0, 0, 0, 0)
+        nexus_sort_layout.setSpacing(6)
+        nexus_sort_lbl = QLabel("<b>Сортировка:</b>")
+        nexus_sort_lbl.setStyleSheet("color: #94a3b8;")
+        self.nexus_collection_sort_combo = QComboBox()
+        self.nexus_collection_sort_combo.addItem("🔥 Топ по скачиваниям", "downloads")
+        self.nexus_collection_sort_combo.addItem("👍 Топ по одобрениям", "endorsements")
+        self.nexus_collection_sort_combo.addItem("⭐ Высокий рейтинг", "rating")
+        self.nexus_collection_sort_combo.addItem("🔄 Недавно обновлённые", "recent")
+        self.nexus_collection_sort_combo.addItem("✨ Новые", "new")
+        self.nexus_collection_sort_combo.currentIndexChanged.connect(self.on_nexus_collection_sort_changed)
+        nexus_sort_layout.addWidget(nexus_sort_lbl)
+        nexus_sort_layout.addWidget(self.nexus_collection_sort_combo, stretch=1)
+        self.nexus_collection_sort_container.setVisible(False)
+
         self.mod_search_input = QLineEdit()
         self.mod_search_input.setPlaceholderText("Поиск модов для выбранной игры...")
         self.mod_search_input.setClearButtonEnabled(True)
@@ -722,7 +771,9 @@ class ModsTabWidget(QWidget):
         self.mods_list.itemDoubleClicked.connect(self.open_mod_workshop)
 
         mods_layout.addWidget(self.active_game_label)
+        mods_layout.addWidget(self.nexus_type_container)
         mods_layout.addWidget(self.nexus_category_container)
+        mods_layout.addWidget(self.nexus_collection_sort_container)
         mods_layout.addWidget(self.mod_search_input)
         mods_layout.addWidget(self.mods_list)
 
@@ -782,7 +833,39 @@ class ModsTabWidget(QWidget):
         description_box_layout.addWidget(self.description_text)
         details_layout.addWidget(self.description_box, stretch=1)
 
-        # Блок выбора файлов Nexus Mods
+        # Блок со списком модов внутри коллекции
+        self.collection_mods_box = QGroupBox("Состав коллекции (моды)")
+        self.collection_mods_box.setVisible(False)
+        col_box_layout = QVBoxLayout(self.collection_mods_box)
+        col_box_layout.setContentsMargins(6, 6, 6, 6)
+        col_box_layout.setSpacing(6)
+
+        col_filter_row = QHBoxLayout()
+        self.col_mod_filter_input = QLineEdit()
+        self.col_mod_filter_input.setPlaceholderText("🔎 Быстрый поиск в списке модов коллекции...")
+        self.col_mod_filter_input.setClearButtonEnabled(True)
+        self.col_mod_filter_input.textChanged.connect(self.filter_collection_mods)
+        col_filter_row.addWidget(self.col_mod_filter_input)
+        col_box_layout.addLayout(col_filter_row)
+
+        self.collection_mods_table = QTableWidget()
+        self.collection_mods_table.setColumnCount(5)
+        self.collection_mods_table.setHorizontalHeaderLabels(["№", "Тип", "Мод", "Версия", "Размер"])
+        self.collection_mods_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.collection_mods_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.collection_mods_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.collection_mods_table.verticalHeader().setVisible(False)
+        self.collection_mods_table.horizontalHeader().setStretchLastSection(False)
+        self.collection_mods_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.collection_mods_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.collection_mods_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.collection_mods_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.collection_mods_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.collection_mods_table.itemSelectionChanged.connect(self.on_collection_mod_selected)
+        col_box_layout.addWidget(self.collection_mods_table)
+        details_layout.addWidget(self.collection_mods_box, stretch=2)
+
+        # Блок выбора файлов Nexus Mods (для одиночных модов)
         self.nexus_files_row = QHBoxLayout()
         self.nexus_files_lbl = QLabel("<b>Файл для скачивания:</b>")
         self.nexus_files_lbl.setStyleSheet("color: #94a3b8;")
@@ -796,8 +879,10 @@ class ModsTabWidget(QWidget):
         self.nexus_files_container.setVisible(False)
         details_layout.addWidget(self.nexus_files_container)
 
-        # Кнопка скачивания и ссылка на страницу
-        actions_row = QHBoxLayout()
+        # Действия для одиночных модов (Steam и Nexus Mods)
+        self.single_mod_actions_container = QWidget()
+        actions_row = QHBoxLayout(self.single_mod_actions_container)
+        actions_row.setContentsMargins(0, 0, 0, 0)
         actions_row.setSpacing(10)
 
         self.browser_button = QPushButton("🌐 Открыть в Workshop")
@@ -813,7 +898,47 @@ class ModsTabWidget(QWidget):
 
         actions_row.addWidget(self.browser_button)
         actions_row.addWidget(self.download_button, stretch=1)
-        details_layout.addLayout(actions_row)
+        details_layout.addWidget(self.single_mod_actions_container)
+
+        # Действия для коллекций Nexus Mods
+        self.collection_actions_container = QWidget()
+        col_actions_layout = QVBoxLayout(self.collection_actions_container)
+        col_actions_layout.setContentsMargins(0, 0, 0, 0)
+        col_actions_layout.setSpacing(6)
+
+        c_row1 = QHBoxLayout()
+        c_row1.setSpacing(8)
+        self.download_collection_btn = QPushButton("📥 Скачать всю коллекцию в очередь")
+        self.download_collection_btn.setObjectName("accentBtn")
+        self.download_collection_btn.setFixedHeight(36)
+        self.download_collection_btn.setEnabled(False)
+        self.download_collection_btn.clicked.connect(self.download_entire_collection)
+
+        self.download_col_manifest_btn = QPushButton("💾 Манифест (.7z)")
+        self.download_col_manifest_btn.setFixedHeight(36)
+        self.download_col_manifest_btn.setEnabled(False)
+        self.download_col_manifest_btn.clicked.connect(self.download_collection_manifest)
+
+        c_row1.addWidget(self.download_collection_btn, stretch=3)
+        c_row1.addWidget(self.download_col_manifest_btn, stretch=1)
+
+        c_row2 = QHBoxLayout()
+        c_row2.setSpacing(8)
+        self.col_browser_btn = QPushButton("🌐 Открыть на Nexus Mods")
+        self.col_browser_btn.setObjectName("secondaryBtn")
+        self.col_browser_btn.clicked.connect(self.open_mod_workshop)
+
+        self.download_single_col_mod_btn = QPushButton("⬇️ Скачать выбранный мод из коллекции")
+        self.download_single_col_mod_btn.setEnabled(False)
+        self.download_single_col_mod_btn.clicked.connect(self.download_selected_collection_mod)
+
+        c_row2.addWidget(self.col_browser_btn, stretch=1)
+        c_row2.addWidget(self.download_single_col_mod_btn, stretch=2)
+
+        col_actions_layout.addLayout(c_row1)
+        col_actions_layout.addLayout(c_row2)
+        self.collection_actions_container.setVisible(False)
+        details_layout.addWidget(self.collection_actions_container)
 
         self.main_splitter.addWidget(self.details_container)
         self.main_splitter.setSizes([240, 360, 520])
@@ -844,20 +969,28 @@ class ModsTabWidget(QWidget):
         self.mod_debounce_timer.timeout.connect(self._on_mod_debounced)
 
     def _on_game_debounced(self):
-        """Отправляет сетевой запрос за списком модов только когда пользователь остановился на игре/категории."""
+        """Отправляет сетевой запрос за списком модов или коллекций только когда пользователь остановился на игре/категории."""
         if self.source_mode == "nexus":
-            self.load_nexus_mods_for_current_game()
+            if getattr(self, "nexus_type", "mods") == "collections":
+                self.load_nexus_collections_for_current_game()
+            else:
+                self.load_nexus_mods_for_current_game()
         else:
             if self.current_appid:
                 self.load_workshop_mods_for_current_game()
 
     def _on_mod_debounced(self):
-        """Отправляет сетевой запрос за файлами и описанием только когда пользователь остановился на моде."""
-        if self.source_mode == "nexus" and self.current_mod:
-            mid = self.current_mod.get("mod_id")
-            if mid:
-                self.load_nexus_mod_files(mid, self._details_req_id)
-                self.load_nexus_mod_details(mid, self._details_req_id)
+        """Отправляет сетевой запрос за файлами и описанием только когда пользователь остановился на моде/коллекции."""
+        if self.source_mode == "nexus":
+            if getattr(self, "nexus_type", "mods") == "collections" and self.current_collection:
+                slug = self.current_collection.get("slug")
+                if slug:
+                    self.load_nexus_collection_details(slug, self._details_req_id)
+            elif self.current_mod:
+                mid = self.current_mod.get("mod_id")
+                if mid:
+                    self.load_nexus_mod_files(mid, self._details_req_id)
+                    self.load_nexus_mod_details(mid, self._details_req_id)
 
     def on_games_tab_changed(self, index: int):
         """Срабатывает при переключении вкладок игр (Сохранённые / Поиск / Nexus)."""
@@ -880,17 +1013,69 @@ class ModsTabWidget(QWidget):
         return ""
 
     # ==========================================
-    # ПЕРЕКЛЮЧЕНИЕ ИСТОЧНИКА
+    # ПЕРЕКЛЮЧЕНИЕ ИСТОЧНИКА И ТИПА
     # ==========================================
+
+    def set_nexus_type(self, type_name: str):
+        """Переключает режим отображения между одиночными модами и коллекциями."""
+        if type_name == getattr(self, "nexus_type", "mods"):
+            return
+        self.nexus_type = type_name
+        self.btn_view_mods.setChecked(type_name == "mods")
+        self.btn_view_collections.setChecked(type_name == "collections")
+
+        self.mods_list.clear()
+        self.mod_search_input.clear()
+        self.clear_collection_details()
+        self.current_mod = None
+        self.current_collection = None
+        self._update_selected_mod_info()
+
+        game_title = self.current_nexus_game["name"]
+        if type_name == "collections":
+            self.nexus_category_container.setVisible(False)
+            self.nexus_collection_sort_container.setVisible(True)
+            self.nexus_files_container.setVisible(False)
+            self.collection_mods_box.setVisible(True)
+            self.collection_actions_container.setVisible(True)
+            self.single_mod_actions_container.setVisible(False)
+            self.screenshots_box.setVisible(False)
+            self.active_game_label.setText(f"<b>Коллекции Nexus Mods ({game_title}):</b>")
+            self.mod_search_input.setPlaceholderText(f"Поиск коллекций на Nexus ({game_title}) или оставьте пустым для топа...")
+            self.load_nexus_collections_for_current_game()
+        else:
+            self.nexus_category_container.setVisible(True)
+            self.nexus_collection_sort_container.setVisible(False)
+            self.nexus_files_container.setVisible(True)
+            self.collection_mods_box.setVisible(False)
+            self.collection_actions_container.setVisible(False)
+            self.single_mod_actions_container.setVisible(True)
+            self.browser_button.setText("🌐 Открыть на Nexus Mods")
+            self.active_game_label.setText(f"<b>Моды Nexus Mods ({game_title}):</b>")
+            self.mod_search_input.setPlaceholderText(f"Поиск модов на Nexus ({game_title}) или оставьте пустым для топа...")
+            self.download_button.setText("⚡ Скачать выбранный мод с Nexus Mods")
+            self.populate_nexus_categories(self.current_nexus_game["domain"])
+            self.load_nexus_mods_for_current_game()
+
+    def on_nexus_collection_sort_changed(self, index: int):
+        """Срабатывает при смене сортировки коллекций (топ скачиваний, рейтинг, новые)."""
+        if index >= 0 and hasattr(self, "nexus_collection_sort_combo"):
+            self.nexus_collection_sort = self.nexus_collection_sort_combo.itemData(index) or "downloads"
+            self._request_id += 1
+            self._mods_req_id = self._request_id
+            self.mod_debounce_timer.stop()
+            self.game_debounce_timer.start(250)
 
     def on_source_changed(self, index):
         mode = self.source_combo.itemData(index)
         self.source_mode = mode
         self.current_mod = None
+        self.current_collection = None
         self.mods_list.clear()
         self.mod_search_input.clear()
         self.browser_button.setEnabled(False)
         self.download_button.setEnabled(False)
+        self.clear_collection_details()
         self._update_selected_mod_info()
 
         self._request_id += 1
@@ -904,8 +1089,13 @@ class ModsTabWidget(QWidget):
             self.games_tab_widget.setTabVisible(1, True)
             self.games_tab_widget.setTabVisible(2, False)
             self.games_tab_widget.setCurrentIndex(0)
+            self.nexus_type_container.setVisible(False)
             self.nexus_category_container.setVisible(False)
+            self.nexus_collection_sort_container.setVisible(False)
             self.nexus_files_container.setVisible(False)
+            self.collection_mods_box.setVisible(False)
+            self.collection_actions_container.setVisible(False)
+            self.single_mod_actions_container.setVisible(True)
 
             self.browser_button.setText("🌐 Открыть в Workshop")
             self.active_game_label.setText("<b>Моды мастерской Steam (Workshop):</b>")
@@ -918,15 +1108,32 @@ class ModsTabWidget(QWidget):
             self.games_tab_widget.setTabVisible(1, False)
             self.games_tab_widget.setTabVisible(2, True)
             self.games_tab_widget.setCurrentIndex(2)
-            self.nexus_category_container.setVisible(True)
-            self.nexus_files_container.setVisible(True)
+            self.nexus_type_container.setVisible(True)
 
-            self.browser_button.setText("🌐 Открыть на Nexus Mods")
             game_title = self.current_nexus_game["name"]
-            self.active_game_label.setText(f"<b>Моды Nexus Mods ({game_title}):</b>")
-            self.mod_search_input.setPlaceholderText(f"Поиск модов на Nexus ({game_title}) или оставьте пустым для топа...")
-            self.download_button.setText("⚡ Скачать выбранный мод с Nexus Mods")
-            self.populate_nexus_categories(self.current_nexus_game["domain"])
+            if getattr(self, "nexus_type", "mods") == "collections":
+                self.nexus_category_container.setVisible(False)
+                self.nexus_collection_sort_container.setVisible(True)
+                self.nexus_files_container.setVisible(False)
+                self.collection_mods_box.setVisible(True)
+                self.collection_actions_container.setVisible(True)
+                self.single_mod_actions_container.setVisible(False)
+                self.screenshots_box.setVisible(False)
+                self.active_game_label.setText(f"<b>Коллекции Nexus Mods ({game_title}):</b>")
+                self.mod_search_input.setPlaceholderText(f"Поиск коллекций на Nexus ({game_title}) или оставьте пустым для топа...")
+            else:
+                self.nexus_category_container.setVisible(True)
+                self.nexus_collection_sort_container.setVisible(False)
+                self.nexus_files_container.setVisible(True)
+                self.collection_mods_box.setVisible(False)
+                self.collection_actions_container.setVisible(False)
+                self.single_mod_actions_container.setVisible(True)
+                self.browser_button.setText("🌐 Открыть на Nexus Mods")
+                self.active_game_label.setText(f"<b>Моды Nexus Mods ({game_title}):</b>")
+                self.mod_search_input.setPlaceholderText(f"Поиск модов на Nexus ({game_title}) или оставьте пустым для топа...")
+                self.download_button.setText("⚡ Скачать выбранный мод с Nexus Mods")
+                self.populate_nexus_categories(self.current_nexus_game["domain"])
+
             self.game_debounce_timer.start(250)
 
     def populate_nexus_categories(self, game_domain: str):
@@ -1165,6 +1372,30 @@ class ModsTabWidget(QWidget):
         self._register_worker(self.mod_worker)
         self.mod_worker.start()
 
+    def load_nexus_collections_for_current_game(self):
+        """Загружает коллекции модов Nexus Mods для выбранной игры."""
+        self.mods_list.clear()
+        self.clear_collection_details()
+        req_id = self._mods_req_id
+
+        game_info = self.current_nexus_game
+        sort = getattr(self, "nexus_collection_sort", "downloads")
+        self.status_label.setText(f"Загрузка коллекций Nexus Mods для {game_info['name']}...")
+
+        self.mod_worker = AsyncWorker(
+            req_id,
+            self.nexus_api.search_collections,
+            query="",
+            sort=sort,
+            game_id=game_info["game_id"],
+            game_domain=game_info["domain"],
+            count=30,
+        )
+        self.mod_worker.result_ready.connect(self.on_nexus_collections_loaded)
+        self.mod_worker.error_occurred.connect(self.on_network_error)
+        self._register_worker(self.mod_worker)
+        self.mod_worker.start()
+
     def on_mod_text_changed(self, text):
         self.mod_query = text
         self.mod_timer.start(350)
@@ -1177,6 +1408,25 @@ class ModsTabWidget(QWidget):
 
         if self.source_mode == "nexus":
             game_info = self.current_nexus_game
+            if getattr(self, "nexus_type", "mods") == "collections":
+                sort = getattr(self, "nexus_collection_sort", "downloads")
+                desc = f"'{query}'" if query else "топ коллекций"
+                self.status_label.setText(f"Nexus Mods: поиск коллекций {desc}...")
+                self.mod_worker = AsyncWorker(
+                    req_id,
+                    self.nexus_api.search_collections,
+                    query=query,
+                    sort=sort,
+                    game_id=game_info["game_id"],
+                    game_domain=game_info["domain"],
+                    count=30,
+                )
+                self.mod_worker.result_ready.connect(self.on_nexus_collections_loaded)
+                self.mod_worker.error_occurred.connect(self.on_network_error)
+                self._register_worker(self.mod_worker)
+                self.mod_worker.start()
+                return
+
             category = self.current_nexus_category
             cat_disp = self.nexus_category_combo.currentText() if hasattr(self, "nexus_category_combo") and self.nexus_category_combo.count() > 0 else "Все"
             desc = f"'{query}'" if query else f"топ популярных ({cat_disp})"
@@ -1245,8 +1495,45 @@ class ModsTabWidget(QWidget):
 
         self.status_label.setText(f"Nexus Mods: найдено {len(mods)} модов")
 
+    def on_nexus_collections_loaded(self, req_id, collections):
+        if req_id != self._mods_req_id:
+            return
+
+        self.mods_list.clear()
+        for col in collections:
+            cnt = col.get("mod_count", 0)
+            sz = col.get("total_size_human", "—")
+            dl = col.get("downloads", 0)
+            dl_str = f"📥 {dl:,}" if dl else ""
+            end = col.get("endorsements", 0)
+            end_str = f"👍 {end:,}" if end else ""
+            user = col.get("user")
+            user_str = f"👤 {user}" if user else ""
+
+            line1 = f"📚 {col['name']}  [📦 {cnt} модов | 💾 {sz}]"
+            stats = [p for p in [dl_str, end_str, user_str] if p]
+            line2 = "  |  ".join(stats) if stats else ""
+
+            item_text = f"{line1}\n{line2}" if line2 else line1
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.ItemDataRole.UserRole, col)
+            self.mods_list.addItem(item)
+
+        self.status_label.setText(f"Nexus Mods: найдено {len(collections)} коллекций")
+
     def on_mod_selected(self, item):
-        self.current_mod = item.data(Qt.ItemDataRole.UserRole)
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if getattr(self, "nexus_type", "mods") == "collections" and self.source_mode == "nexus":
+            self.current_collection = data
+            self.current_mod = None
+            self._update_selected_collection_info()
+            self._request_id += 1
+            self._details_req_id = self._request_id
+            self.mod_debounce_timer.start(250)
+            return
+
+        self.current_mod = data
+        self.current_collection = None
         self._update_selected_mod_info()
 
         if self.source_mode == "nexus" and self.current_mod:
@@ -1480,6 +1767,10 @@ class ModsTabWidget(QWidget):
 
     def _update_selected_mod_info(self):
         if self.source_mode == "nexus":
+            if getattr(self, "nexus_type", "mods") == "collections":
+                self._update_selected_collection_info()
+                return
+
             if self.current_mod:
                 title = self.current_mod.get("title", "Без названия")
                 author = self.current_mod.get("author", "Неизвестен")
@@ -1527,6 +1818,356 @@ class ModsTabWidget(QWidget):
             self.screenshots_box.setVisible(False)
             self.download_button.setEnabled(False)
 
+    # ==========================================
+    # РАБОТА С КОЛЛЕКЦИЯМИ NEXUS MODS
+    # ==========================================
+
+    def _update_selected_collection_info(self):
+        if not self.current_collection:
+            self.clear_collection_details()
+            self.details_title.setText("<i>Выберите коллекцию из списка</i>")
+            self.details_meta.setText("Выберите коллекцию для просмотра состава модов и описания.")
+            self.description_box.setVisible(False)
+            self.collection_mods_box.setVisible(False)
+            self.collection_actions_container.setVisible(False)
+            return
+
+        c = self.current_collection
+        name = c.get("name", "Без названия")
+        user = c.get("user", "Неизвестен")
+        cnt = c.get("mod_count", 0)
+        sz = c.get("total_size_human", "—")
+        dl = c.get("downloads", 0)
+        end = c.get("endorsements", 0)
+        summary = c.get("summary", "")
+
+        self.details_title.setText(f"<b>📚 {name}</b>")
+        self.details_meta.setText(
+            f"👤 <b>Куратор:</b> {user} &nbsp;|&nbsp; "
+            f"📦 <b>{cnt}</b> модов &nbsp;|&nbsp; "
+            f"💾 <b>{sz}</b> &nbsp;|&nbsp; "
+            f"📥 <b>{dl:,}</b> скачиваний &nbsp;|&nbsp; "
+            f"👍 <b>{end:,}</b> одобрений"
+        )
+        self.description_box.setVisible(True)
+        self.description_text.setHtml(
+            f"<i>{summary}</i><br><br><i>Загрузка полного состава коллекции и списка модов...</i>"
+            if summary else "<i>Загрузка полного состава коллекции и списка модов...</i>"
+        )
+        self.screenshots_box.setVisible(False)
+        self.collection_mods_box.setVisible(True)
+        self.collection_actions_container.setVisible(True)
+        self.download_collection_btn.setText(f"📥 Скачать всю коллекцию ({cnt} модов)")
+        self.download_collection_btn.setEnabled(False)
+        self.download_col_manifest_btn.setEnabled(False)
+        self.download_single_col_mod_btn.setEnabled(False)
+        self.col_browser_btn.setEnabled(True)
+
+    def clear_collection_details(self):
+        self.current_collection_details = None
+        self.selected_collection_mod = None
+        if hasattr(self, "collection_mods_table"):
+            self.collection_mods_table.setRowCount(0)
+        if hasattr(self, "col_mod_filter_input"):
+            self.col_mod_filter_input.clear()
+        if hasattr(self, "download_collection_btn"):
+            self.download_collection_btn.setEnabled(False)
+            self.download_col_manifest_btn.setEnabled(False)
+            self.download_single_col_mod_btn.setEnabled(False)
+
+    def load_nexus_collection_details(self, slug: str, req_id: Optional[int] = None):
+        """Запрашивает данные о коллекции и составе её модов."""
+        if not slug:
+            return
+
+        if req_id is None:
+            self._request_id += 1
+            self._details_req_id = self._request_id
+            req_id = self._details_req_id
+
+        self.description_box.setVisible(True)
+        self.description_text.setHtml("<i>Загрузка данных коллекции и списка модов со страниц Nexus Mods...</i>")
+        self.collection_mods_table.setRowCount(0)
+        self.download_collection_btn.setEnabled(False)
+        self.download_col_manifest_btn.setEnabled(False)
+        self.download_single_col_mod_btn.setEnabled(False)
+        self.status_label.setText(f"Загрузка состава коллекции '{slug}'...")
+
+        domain = self.current_collection.get("game_domain", self.current_nexus_game["domain"]) if self.current_collection else self.current_nexus_game["domain"]
+
+        self.details_worker = AsyncWorker(
+            req_id,
+            self.nexus_api.get_collection_details,
+            slug=slug,
+            game_domain=domain,
+        )
+        self.details_worker.result_ready.connect(self.on_nexus_collection_details_loaded)
+        self.details_worker.error_occurred.connect(self.on_network_error)
+        self._register_worker(self.details_worker)
+        self.details_worker.start()
+
+    def on_nexus_collection_details_loaded(self, req_id, details):
+        if req_id != self._details_req_id or not details:
+            return
+
+        self.current_collection_details = details
+
+        # 1. Текст описания в Markdown
+        desc_md = details.get("description") or details.get("summary") or "<i>Описание отсутствует</i>"
+        try:
+            self.description_text.setMarkdown(desc_md)
+        except Exception:
+            self.description_text.setHtml(desc_md.replace("\n", "<br>"))
+
+        # 2. Метаданные коллекции
+        name = details.get("name", "Коллекция")
+        user = details.get("user", "Неизвестен")
+        cnt = details.get("mod_count", 0)
+        sz = details.get("total_size_human", "—")
+        dl = details.get("downloads", 0)
+        end = details.get("endorsements", 0)
+        rev = details.get("revision_number", 1)
+
+        self.details_title.setText(f"<b>📚 {name}</b>")
+        self.details_meta.setText(
+            f"👤 Куратор: <b>{user}</b> &nbsp;|&nbsp; "
+            f"📦 <b>{cnt}</b> модов &nbsp;|&nbsp; "
+            f"💾 <b>{sz}</b> &nbsp;|&nbsp; "
+            f"📥 <b>{dl:,}</b> скачиваний &nbsp;|&nbsp; "
+            f"👍 <b>{end:,}</b> одобрений &nbsp;|&nbsp; "
+            f"Ревизия <b>#{rev}</b>"
+        )
+
+        # 3. Заполнение таблицы модов коллекции
+        mods = details.get("mods") or []
+        self._populate_collection_mods_table(mods)
+
+        # 4. Управление кнопками
+        self.download_collection_btn.setText(f"📥 Скачать всю коллекцию ({cnt} модов)")
+        self.download_collection_btn.setEnabled(len(mods) > 0)
+        self.download_col_manifest_btn.setEnabled(bool(details.get("download_link")))
+        self.col_browser_btn.setEnabled(True)
+
+        self.status_label.setText(f"Коллекция '{name}' загружена: {len(mods)} модов")
+
+    def _populate_collection_mods_table(self, mods: List[Dict[str, Any]]):
+        """Заполняет таблицу модов коллекции данными."""
+        self.collection_mods_table.setRowCount(0)
+        self.collection_mods_table.setRowCount(len(mods))
+
+        for row, m in enumerate(mods):
+            idx_item = QTableWidgetItem(str(m.get("index", row + 1)))
+            idx_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            opt = m.get("optional", False)
+            type_str = "Опц." if opt else "Основной"
+            type_item = QTableWidgetItem(type_str)
+            type_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if opt:
+                type_item.setForeground(Qt.GlobalColor.gray)
+            else:
+                type_item.setForeground(Qt.GlobalColor.cyan)
+
+            name_item = QTableWidgetItem(m.get("name", "Mod"))
+            name_item.setData(Qt.ItemDataRole.UserRole, m)
+
+            ver_item = QTableWidgetItem(str(m.get("version", "")))
+            ver_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            sz_item = QTableWidgetItem(m.get("size_human", "—"))
+            sz_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            self.collection_mods_table.setItem(row, 0, idx_item)
+            self.collection_mods_table.setItem(row, 1, type_item)
+            self.collection_mods_table.setItem(row, 2, name_item)
+            self.collection_mods_table.setItem(row, 3, ver_item)
+            self.collection_mods_table.setItem(row, 4, sz_item)
+
+    def filter_collection_mods(self, text: str):
+        """Фильтрует строки таблицы состава коллекции по введенному тексту."""
+        query = text.strip().lower()
+        for row in range(self.collection_mods_table.rowCount()):
+            name_item = self.collection_mods_table.item(row, 2)
+            if not name_item:
+                continue
+            match = not query or (query in name_item.text().lower())
+            self.collection_mods_table.setRowHidden(row, not match)
+
+    def on_collection_mod_selected(self):
+        """Срабатывает при клике на строку мода в таблице состава коллекции."""
+        selected_rows = self.collection_mods_table.selectionModel().selectedRows()
+        if not selected_rows:
+            self.selected_collection_mod = None
+            self.download_single_col_mod_btn.setEnabled(False)
+            self.download_single_col_mod_btn.setText("⬇️ Скачать выбранный мод из коллекции")
+            return
+
+        row = selected_rows[0].row()
+        item = self.collection_mods_table.item(row, 2)
+        if item:
+            self.selected_collection_mod = item.data(Qt.ItemDataRole.UserRole)
+            m_name = self.selected_collection_mod.get("name", "мод")
+            short_name = m_name[:24] + "..." if len(m_name) > 24 else m_name
+            self.download_single_col_mod_btn.setText(f"⬇️ Скачать '{short_name}'")
+            self.download_single_col_mod_btn.setEnabled(True)
+
+    def download_entire_collection(self):
+        """Добавляет все файлы модов коллекции в общую очередь загрузок."""
+        if not self.current_collection_details:
+            return
+
+        mods = self.current_collection_details.get("mods") or []
+        if not mods:
+            QMessageBox.warning(self, "Внимание", "В выбранной коллекции нет доступных файлов для скачивания.")
+            return
+
+        col_name = self.current_collection_details.get("name", "Коллекция")
+        total_sz = self.current_collection_details.get("total_size_human", "—")
+        count = len(mods)
+
+        req_mods = [m for m in mods if not m.get("optional", False)]
+        opt_mods = [m for m in mods if m.get("optional", False)]
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Скачивание коллекции Nexus Mods")
+        msg_box.setText(
+            f"<b>Коллекция:</b> {col_name}<br>"
+            f"<b>Всего модов:</b> {count} (обязательных: {len(req_mods)}, опциональных: {len(opt_mods)})<br>"
+            f"<b>Общий размер:</b> ~{total_sz}<br><br>"
+            "Все моды будут последовательно добавлены в очередь загрузок лаунчера "
+            "с соблюдением интервалов между запросами (защита от лимитов Nexus Mods)."
+        )
+
+        btn_all = msg_box.addButton(f"Скачать ВСЕ ({count})", QMessageBox.ButtonRole.AcceptRole)
+        btn_req = None
+        if opt_mods:
+            btn_req = msg_box.addButton(f"Только обязательные ({len(req_mods)})", QMessageBox.ButtonRole.ActionRole)
+        btn_cancel = msg_box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+
+        msg_box.exec()
+        clicked = msg_box.clickedButton()
+
+        if clicked == btn_cancel:
+            return
+
+        mods_to_queue = req_mods if (btn_req and clicked == btn_req) else mods
+
+        qm = get_download_queue_manager(self.nexus_api)
+        domain = self.current_collection_details.get("game_domain", self.current_nexus_game["domain"])
+        save_folder = self.get_mods_folder()
+        if not save_folder or not os.path.isdir(save_folder):
+            save_folder = os.getenv("MODS_FOLDER") or os.path.join(os.getcwd(), "mods")
+        os.makedirs(save_folder, exist_ok=True)
+
+        added = 0
+        for m in mods_to_queue:
+            file_id = m.get("file_id")
+            mod_id = m.get("mod_id")
+            if not file_id:
+                continue
+            qm.add_nexus_task(
+                mod_id=mod_id or file_id,
+                file_id=file_id,
+                title=f"[{col_name}] {m.get('name', 'Mod')}",
+                file_name=f"{m.get('name', 'mod')}_{file_id}.zip",
+                game_id=m.get("game_id", self.current_nexus_game["game_id"]),
+                game_domain=domain,
+                save_dir=save_folder,
+                size_human=m.get("size_human", "—"),
+            )
+            added += 1
+
+        self.download_collection_btn.setText(f"✓ Добавлено {added} модов в очередь!")
+        QTimer.singleShot(2500, lambda: self.download_collection_btn.setText(f"📥 Скачать всю коллекцию ({count} модов)"))
+        self.status_label.setText(f"Добавлено {added} модов коллекции '{col_name}' в очередь скачивания")
+        QMessageBox.information(
+            self,
+            "Коллекция добавлена в очередь",
+            f"Успешно добавлено {added} модов в очередь скачивания!\n\n"
+            "Перейдите во вкладку «Загрузки» для наблюдения за процессом скачивания и скоростью."
+        )
+
+    def download_selected_collection_mod(self):
+        """Добавляет выбранный мод из таблицы коллекции в очередь скачивания."""
+        if not self.selected_collection_mod:
+            return
+
+        m = self.selected_collection_mod
+        file_id = m.get("file_id")
+        mod_id = m.get("mod_id")
+        if not file_id:
+            QMessageBox.warning(self, "Внимание", "У выбранного мода отсутствует file_id.")
+            return
+
+        col_name = self.current_collection_details.get("name", "Коллекция") if self.current_collection_details else "Коллекция"
+        domain = self.current_collection_details.get("game_domain", self.current_nexus_game["domain"]) if self.current_collection_details else self.current_nexus_game["domain"]
+        save_folder = self.get_mods_folder()
+        if not save_folder or not os.path.isdir(save_folder):
+            save_folder = os.getenv("MODS_FOLDER") or os.path.join(os.getcwd(), "mods")
+        os.makedirs(save_folder, exist_ok=True)
+
+        qm = get_download_queue_manager(self.nexus_api)
+        task = qm.add_nexus_task(
+            mod_id=mod_id or file_id,
+            file_id=file_id,
+            title=f"[{col_name}] {m.get('name', 'Mod')}",
+            file_name=f"{m.get('name', 'mod')}_{file_id}.zip",
+            game_id=m.get("game_id", self.current_nexus_game["game_id"]),
+            game_domain=domain,
+            save_dir=save_folder,
+            size_human=m.get("size_human", "—"),
+        )
+        self.download_single_col_mod_btn.setText(f"✓ Добавлен (#{task.task_id})!")
+        m_name = m.get("name", "мод")
+        short_name = m_name[:24] + "..." if len(m_name) > 24 else m_name
+        QTimer.singleShot(1500, lambda: self.download_single_col_mod_btn.setText(f"⬇️ Скачать '{short_name}'"))
+
+    def download_collection_manifest(self):
+        """Скачивает файл манифеста Vortex коллекции (.7z)."""
+        if not self.current_collection_details:
+            return
+        link = self.current_collection_details.get("download_link")
+        if not link:
+            QMessageBox.warning(self, "Внимание", "Для этой ревизии коллекции ссылка на манифест не найдена.")
+            return
+
+        self.status_label.setText("Получение прямой ссылки на манифест (.7z)...")
+        manifest_url = self.nexus_api.get_collection_manifest_url(link)
+        if not manifest_url:
+            QMessageBox.warning(self, "Ошибка", "Не удалось сгенерировать прямую ссылку на манифест коллекции.")
+            return
+
+        save_folder = self.get_mods_folder()
+        if not save_folder or not os.path.isdir(save_folder):
+            save_folder = os.getenv("MODS_FOLDER") or os.path.join(os.getcwd(), "mods")
+        os.makedirs(save_folder, exist_ok=True)
+
+        col_slug = self.current_collection_details.get("slug", "collection")
+        col_name = self.current_collection_details.get("name", "collection")
+        rev = self.current_collection_details.get("revision_number", 1)
+        import re
+        safe_name = re.sub(r'[\\/*?:"<>|]', "_", f"{col_name}_rev{rev}_{col_slug}.7z")
+        target_path = os.path.join(save_folder, safe_name)
+
+        try:
+            dl_session = self.nexus_api.create_session()
+            resp = dl_session.get(manifest_url, stream=True, timeout=20)
+            if resp.status_code == 200:
+                with open(target_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=64 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                QMessageBox.information(
+                    self,
+                    "Манифест скачан",
+                    f"Файл манифеста коллекции успешно сохранён:\n{target_path}"
+                )
+                self.status_label.setText(f"Манифест коллекции сохранён в {safe_name}")
+            else:
+                QMessageBox.warning(self, "Ошибка", f"Сервер вернул статус {resp.status_code} при скачивании манифеста.")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка скачивания", f"Не удалось скачать манифест: {e}")
+
     def select_game(self, game_name: str, appid: int):
         if appid and appid > 0:
             game = {"name": game_name, "appid": appid}
@@ -1544,6 +2185,18 @@ class ModsTabWidget(QWidget):
             self.do_search_games()
 
     def open_mod_workshop(self, item=None):
+        if getattr(self, "nexus_type", "mods") == "collections" and self.source_mode == "nexus":
+            url = None
+            if self.current_collection_details and self.current_collection_details.get("url"):
+                url = self.current_collection_details["url"]
+            elif self.current_collection and self.current_collection.get("url"):
+                url = self.current_collection["url"]
+            elif self.current_nexus_game:
+                url = f"https://next.nexusmods.com/{self.current_nexus_game['domain']}/collections"
+            if url:
+                webbrowser.open(url)
+            return
+
         mod = self.current_mod
         if item and hasattr(item, "data"):
             mod = item.data(Qt.ItemDataRole.UserRole) or mod
