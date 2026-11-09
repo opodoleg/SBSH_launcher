@@ -60,6 +60,7 @@ from modules.saved_games import saved_games_manager
 from modules.download_queue import get_download_queue_manager
 from modules.installed_mods import installed_mods_manager
 from modules.downloaded_mods import downloaded_mods_manager
+from modules.mod_pipeline import mod_download_pipeline, clean_mod_title
 
 
 # ==========================================================
@@ -815,13 +816,29 @@ class SteamSearchUI(QWidget):
         self.mod_search_input.setPlaceholderText("Поиск модов для выбранной игры...")
         self.mod_search_input.setClearButtonEnabled(True)
 
+        # Алфавитный фильтр (A-Z)
+        self.letter_filter_combo = QComboBox()
+        self.letter_filter_combo.addItem("🔤 Все", "")
+        for ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            self.letter_filter_combo.addItem(ch, ch)
+        self.letter_filter_combo.addItem("0-9", "0-9")
+        self.letter_filter_combo.setToolTip("Фильтровать моды по первой букве названия (A-Z)")
+        self.letter_filter_combo.currentIndexChanged.connect(self._apply_mods_filtering)
+
         self.filter_only_installed_cb = QCheckBox("✓ Установленные")
         self.filter_only_installed_cb.setStyleSheet("color: #38bdf8; font-size: 11px;")
         self.filter_only_installed_cb.setToolTip("Показывать только скачанные и установленные на диске моды")
-        self.filter_only_installed_cb.stateChanged.connect(self._filter_mods_list_installed)
+        self.filter_only_installed_cb.stateChanged.connect(self._apply_mods_filtering)
 
-        mod_search_row.addWidget(self.mod_search_input, stretch=1)
+        self.download_pipeline_btn = QPushButton("⚡ Скачать недостающие")
+        self.download_pipeline_btn.setObjectName("secondaryBtn")
+        self.download_pipeline_btn.setToolTip("Умный конвейер дедупликации: проверить видимые моды, пропустить уже имеющиеся и скачать только недостающие/обновлённые")
+        self.download_pipeline_btn.clicked.connect(self.download_visible_pipeline_mods)
+
+        mod_search_row.addWidget(self.mod_search_input, stretch=2)
+        mod_search_row.addWidget(self.letter_filter_combo)
         mod_search_row.addWidget(self.filter_only_installed_cb)
+        mod_search_row.addWidget(self.download_pipeline_btn)
 
         self.mods_list = QListWidget()
         self.mods_list.itemClicked.connect(self.on_mod_selected)
@@ -1583,6 +1600,7 @@ class SteamSearchUI(QWidget):
             self.mods_list.addItem(item)
 
         self.status_label.setText(f"Загружено модов: {len(mods)} (скачано: {installed_count})")
+        self._apply_mods_filtering()
 
     def on_nexus_mods_loaded(self, req_id, mods):
         if req_id != self._mods_req_id:
@@ -1622,6 +1640,7 @@ class SteamSearchUI(QWidget):
             self.mods_list.addItem(item)
 
         self.status_label.setText(f"Nexus Mods: найдено {len(mods)} модов (скачано: {installed_count})")
+        self._apply_mods_filtering()
 
     def on_nexus_collections_loaded(self, req_id, collections):
         if req_id != self._mods_req_id:
@@ -1666,6 +1685,7 @@ class SteamSearchUI(QWidget):
             self.mods_list.addItem(item)
 
         self.status_label.setText(f"Nexus Collections: найдено {len(collections)} коллекций (скачано: {installed_count})")
+        self._apply_mods_filtering()
 
     def on_mod_selected(self, item):
         data = item.data(Qt.ItemDataRole.UserRole)
@@ -2148,11 +2168,101 @@ class SteamSearchUI(QWidget):
 
     def _filter_mods_list_installed(self):
         """Фильтрует видимость модов в списке по признаку установки."""
+        self._apply_mods_filtering()
+
+    def _apply_mods_filtering(self):
+        """Фильтрует список модов по: признаку установки, выбранной букве (A-Z) и поисковому запросу."""
+        if not hasattr(self, "mods_list"):
+            return
         only_installed = self.filter_only_installed_cb.isChecked() if hasattr(self, "filter_only_installed_cb") else False
+        letter = ""
+        if hasattr(self, "letter_filter_combo") and self.letter_filter_combo.currentIndex() > 0:
+            letter = self.letter_filter_combo.currentData() or self.letter_filter_combo.currentText()
+            letter = letter.strip().upper()
+
+        visible_count = 0
         for i in range(self.mods_list.count()):
             item = self.mods_list.item(i)
+            mod = item.data(Qt.ItemDataRole.UserRole)
             is_inst = item.data(Qt.ItemDataRole.UserRole + 1)
-            item.setHidden(bool(only_installed and not is_inst))
+
+            # 1. Фильтр "Только установленные"
+            if only_installed and not is_inst:
+                item.setHidden(True)
+                continue
+
+            # 2. Фильтр по букве названия (A-Z, 0-9)
+            if letter and mod:
+                raw_title = str(mod.get("title") or mod.get("name") or "")
+                clean_name = clean_mod_title(raw_title)
+                first_ch = clean_name[:1].upper() if clean_name else ""
+                if letter == "0-9":
+                    if not first_ch.isdigit():
+                        item.setHidden(True)
+                        continue
+                elif first_ch != letter:
+                    item.setHidden(True)
+                    continue
+
+            item.setHidden(False)
+            visible_count += 1
+
+        if letter:
+            self.status_label.setText(f"Фильтр по букве '{letter}': отобрано {visible_count} модов")
+
+    def download_visible_pipeline_mods(self):
+        """Запускает конвейер умной дедупликации и скачивания для всех видимых модов."""
+        visible_mods = []
+        for i in range(self.mods_list.count()):
+            item = self.mods_list.item(i)
+            if not item.isHidden():
+                data = item.data(Qt.ItemDataRole.UserRole)
+                if data:
+                    visible_mods.append(data)
+
+        if not visible_mods:
+            QMessageBox.information(self, "Конвейер загрузки", "В списке нет доступных модов для обработки.")
+            return
+
+        mods_folder = getattr(self, "mods_folder", None) or os.getenv("MODS_FOLDER") or os.path.join(os.getcwd(), "mods")
+        os.makedirs(mods_folder, exist_ok=True)
+
+        letter = self.letter_filter_combo.currentData() if hasattr(self, "letter_filter_combo") else None
+        letter_info = f" (буква '{letter}')" if letter else ""
+
+        reply = QMessageBox.question(
+            self,
+            "Конвейер дедупликации",
+            f"Запустить конвейер проверки и загрузки для {len(visible_mods)} модов{letter_info}?\n\n"
+            "• Моды, которые уже присутствуют локально в mods или игровых папках (archive/pc/mod, r6, mods),\n"
+            "  будут АВТОМАТИЧЕСКИ ПРОПУЩЕНЫ во избежание дублирования.\n"
+            "• В очередь загрузок добавятся только отсутствующие моды или моды с более новыми версиями.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        query_str = self.mod_search_input.text().strip() if hasattr(self, "mod_search_input") else None
+
+        res = mod_download_pipeline.execute_pipeline(
+            mods=visible_mods,
+            letter=letter,
+            query=query_str,
+            sort_alphabetical=True,
+            save_dir=mods_folder,
+            log_callback=lambda msg: self.status_label.setText(msg[:65]),
+        )
+
+        self.status_label.setText(f"Конвейер: проверено {res.matched_filter}, пропущено {res.skipped_count}, добавлено {res.queued_count}")
+        QMessageBox.information(
+            self,
+            "Результат работы конвейера",
+            f"Интеллектуальный конвейер завершил проверку:\n\n"
+            f"📦 Всего проверено модов: {res.matched_filter}\n"
+            f"⏭️ Пропущено (уже скачаны / установлены): {res.skipped_count}\n"
+            f"📥 Добавлено в очередь скачивания: {res.queued_count}\n\n"
+            f"Подробный журнал дедупликации сохранён в pipeline_download.log",
+        )
 
     def _refresh_installed_badges_in_list(self):
         """Обновляет бейджи [✅ Скачано] и цвет в текущем списке модов."""
@@ -2447,39 +2557,30 @@ class SteamSearchUI(QWidget):
 
         mods_to_queue = req_mods if (btn_req and clicked == btn_req) else mods
 
-        qm = get_download_queue_manager(self.nexus_api)
-        domain = self.current_collection_details.get("game_domain", self.current_nexus_game["domain"])
         save_folder = self.mods_folder
         if not save_folder or not os.path.isdir(save_folder):
             save_folder = os.getenv("MODS_FOLDER") or os.path.join(os.getcwd(), "mods")
         os.makedirs(save_folder, exist_ok=True)
 
-        added = 0
-        for m in mods_to_queue:
-            file_id = m.get("file_id")
-            mod_id = m.get("mod_id")
-            if not file_id:
-                continue
-            qm.add_nexus_task(
-                mod_id=mod_id or file_id,
-                file_id=file_id,
-                title=f"[{col_name}] {m.get('name', 'Mod')}",
-                file_name=f"{m.get('name', 'mod')}_{file_id}.zip",
-                game_id=m.get("game_id", self.current_nexus_game["game_id"]),
-                game_domain=domain,
-                save_dir=save_folder,
-                size_human=m.get("size_human", "—"),
-            )
-            added += 1
+        # Выполняем дедупликацию и скачивание через умный конвейер
+        res = mod_download_pipeline.execute_pipeline(
+            mods=mods_to_queue,
+            sort_alphabetical=True,
+            save_dir=save_folder,
+            log_callback=lambda msg: self.status_label.setText(msg[:65]),
+        )
 
-        self.download_collection_btn.setText(f"✓ Добавлено {added} модов в очередь!")
+        self.download_collection_btn.setText(f"✓ Добавлено {res.queued_count} модов!")
         QTimer.singleShot(2500, lambda: self.download_collection_btn.setText(f"📥 Скачать всю коллекцию ({count} модов)"))
-        self.status_label.setText(f"Добавлено {added} модов коллекции '{col_name}' в очередь скачивания")
+        self.status_label.setText(f"Коллекция '{col_name}': проверено {res.matched_filter}, пропущено {res.skipped_count}, добавлено {res.queued_count}")
         QMessageBox.information(
             self,
-            "Коллекция добавлена в очередь",
-            f"Успешно добавлено {added} модов в очередь скачивания!\n\n"
-            "Вы можете наблюдать за процессом скачивания в очереди загрузок."
+            "Коллекция проверена",
+            f"Конвейер дедупликации завершил обработку коллекции '{col_name}':\n\n"
+            f"📦 Всего в коллекции: {res.matched_filter}\n"
+            f"⏭️ Пропущено (уже скачаны / установлены и актуальны): {res.skipped_count}\n"
+            f"📥 Добавлено новых в очередь загрузок: {res.queued_count}\n\n"
+            "Перейдите во вкладку «Загрузки» для наблюдения за процессом скачивания.",
         )
 
     def download_selected_collection_mod(self):

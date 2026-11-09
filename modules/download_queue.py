@@ -239,19 +239,26 @@ class DownloadQueueManager(QObject):
         force: bool = False,
     ) -> DownloadTask:
         """Добавляет файл Nexus Mods в очередь загрузки со сверкой наличия и блокировкой дублей."""
-        from modules.downloaded_mods import downloaded_mods_manager
-
         if not force:
-            is_dl, dl_data = downloaded_mods_manager.is_downloaded(
-                source="nexus",
-                mod_id=mod_id,
-                file_id=file_id,
-                filename=file_name,
-                game_id=game_id,
-                title=title,
+            from modules.mod_pipeline import mod_download_pipeline
+            check = mod_download_pipeline.check_local_mod(
+                remote_mod={
+                    "source": "nexus",
+                    "mod_id": mod_id,
+                    "file_id": file_id,
+                    "title": title,
+                    "name": file_name,
+                    "game_id": game_id,
+                    "game_domain": game_domain,
+                },
+                mods_dir=save_dir,
             )
-            if is_dl and dl_data:
-                existing_p = dl_data.get("filepath", "")
+            if check.is_present and check.is_up_to_date:
+                existing_p = check.matched_path or ""
+                mod_download_pipeline.log(
+                    f"⏭️ [SKIP] Мод '{title}' (file_id: {file_id}) уже найден в '{existing_p}' ({check.matched_source}). "
+                    f"Загрузка пропущена во избежание дублирования."
+                )
                 with self._lock:
                     tid = self._next_id
                     self._next_id += 1
@@ -267,7 +274,7 @@ class DownloadQueueManager(QObject):
                         game_domain=game_domain,
                         save_dir=save_dir,
                         status=STATE_COMPLETED,
-                        status_text="Уже скачан",
+                        status_text="Уже скачан / установлен",
                         progress=100,
                         speed_str="—",
                         saved_path=existing_p,
@@ -316,16 +323,23 @@ class DownloadQueueManager(QObject):
         force: bool = False,
     ) -> DownloadTask:
         """Добавляет мод Steam Workshop в очередь загрузки со сверкой наличия."""
-        from modules.downloaded_mods import downloaded_mods_manager
-
         if not force:
-            is_dl, dl_data = downloaded_mods_manager.is_downloaded(
-                source="steam",
-                mod_id=mod_id,
-                title=title,
+            from modules.mod_pipeline import mod_download_pipeline
+            check = mod_download_pipeline.check_local_mod(
+                remote_mod={
+                    "source": "steam",
+                    "mod_id": mod_id,
+                    "title": title,
+                    "game_id": appid,
+                },
+                mods_dir=save_dir,
             )
-            if is_dl and dl_data:
-                existing_p = dl_data.get("filepath", "")
+            if check.is_present and check.is_up_to_date:
+                existing_p = check.matched_path or ""
+                mod_download_pipeline.log(
+                    f"⏭️ [SKIP] Мод Workshop '{title}' (#{mod_id}) уже найден в '{existing_p}' ({check.matched_source}). "
+                    f"Загрузка пропущена во избежание дублирования."
+                )
                 with self._lock:
                     tid = self._next_id
                     self._next_id += 1
@@ -340,7 +354,7 @@ class DownloadQueueManager(QObject):
                         save_dir=save_dir,
                         steamcmd_path=steamcmd_path,
                         status=STATE_COMPLETED,
-                        status_text="Уже скачан",
+                        status_text="Уже скачан / установлен",
                         progress=100,
                         speed_str="—",
                         saved_path=existing_p,
@@ -512,6 +526,34 @@ class DownloadQueueManager(QObject):
     def _execute_nexus_task(self, task: DownloadTask):
         if task.is_cancelled or not self._is_running:
             return
+
+        # Быстрая проверка перед обращением к Nexus API через конвейер дедупликации
+        if not getattr(task, 'force', False):
+            from modules.mod_pipeline import mod_download_pipeline
+            check = mod_download_pipeline.check_local_mod(
+                remote_mod={
+                    "source": "nexus",
+                    "mod_id": task.mod_id,
+                    "file_id": task.file_id,
+                    "title": task.title,
+                    "name": task.file_name,
+                    "game_id": task.game_id,
+                    "game_domain": task.game_domain,
+                },
+                mods_dir=task.save_dir,
+            )
+            if check.is_present and check.is_up_to_date:
+                mod_download_pipeline.log(
+                    f"⏭️ [SKIP] Фоновый воркер: '{task.title}' уже присутствует в '{check.matched_path}'. Пропуск вызова Nexus API."
+                )
+                task.status = STATE_COMPLETED
+                task.status_text = "Уже скачан"
+                task.progress = 100
+                task.speed_str = "—"
+                task.saved_path = check.matched_path or ""
+                self.task_updated.emit(task)
+                self.task_finished.emit(task.task_id, True, task.saved_path)
+                return
 
         # 1. Этап генерации ссылки
         task.status = STATE_GENERATING_URL

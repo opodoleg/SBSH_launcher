@@ -31,6 +31,7 @@ hiddenimports = [
     'modules.download_queue',
     'modules.installed_mods',
     'modules.downloaded_mods',
+    'modules.mod_pipeline',
     'modules.download_router',
     'ui',
     'ui.styles',
