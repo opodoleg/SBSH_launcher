@@ -204,6 +204,26 @@ class DownloadQueueManager(QObject):
             self._notify_active_count()
             return True
 
+    def retry_task(self, task_id: int) -> bool:
+        """Возобновляет (повторяет) задачу со статусом ошибки или отмены."""
+        with self._lock:
+            task = self._tasks_by_id.get(task_id)
+            if not task:
+                return False
+            if task.status not in [STATE_ERROR, STATE_CANCELLED]:
+                return False
+
+            task.is_cancelled = False
+            task.status = STATE_QUEUED
+            task.status_text = STATUS_LABELS[STATE_QUEUED]
+            task.error_message = ""
+            task.speed_str = "—"
+
+            self._queue.put(task_id)
+            self.task_updated.emit(task)
+            self._notify_active_count()
+            return True
+
     def clear_completed(self):
         """Очищает из списка все завершённые, ошибочные и отменённые задачи."""
         with self._lock:
@@ -325,6 +345,12 @@ class DownloadQueueManager(QObject):
         task.status_text = "Подключение к Nexus Mods..."
         self.task_updated.emit(task)
 
+        def on_status(st: str):
+            if task.is_cancelled or not self._is_running:
+                return
+            task.status_text = st
+            self.task_updated.emit(task)
+
         try:
             saved_path = api.download_file(
                 file_id=task.file_id,
@@ -334,6 +360,9 @@ class DownloadQueueManager(QObject):
                 save_dir=task.save_dir,
                 progress_callback=on_progress,
                 cancel_flag=lambda: task.is_cancelled or not self._is_running,
+                initial_file_name=task.file_name,
+                allow_resume=True,
+                status_callback=on_status,
             )
 
             if task.is_cancelled or not self._is_running:

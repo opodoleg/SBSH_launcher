@@ -185,7 +185,13 @@ class DownloadsTabWidget(QWidget):
         top_bar.addWidget(self.mods_active_badge)
         top_bar.addStretch(1)
 
-        self.cancel_mod_btn = QPushButton("❌ Отменить / Удалить из очереди")
+        self.resume_mod_btn = QPushButton("▶️ Возобновить / Докачать")
+        self.resume_mod_btn.setObjectName("secondaryBtn")
+        self.resume_mod_btn.setEnabled(False)
+        self.resume_mod_btn.setToolTip("Возобновить или докачать прерванную загрузку с места обрыва")
+        self.resume_mod_btn.clicked.connect(self.resume_selected_mod)
+
+        self.cancel_mod_btn = QPushButton("❌ Отменить / Удалить")
         self.cancel_mod_btn.setObjectName("secondaryBtn")
         self.cancel_mod_btn.setEnabled(False)
         self.cancel_mod_btn.setToolTip("Отменить выбранную загрузку или убрать её из очереди")
@@ -201,6 +207,7 @@ class DownloadsTabWidget(QWidget):
         self.open_mods_folder_btn.setToolTip("Открыть папку, куда сохраняются скачанные моды")
         self.open_mods_folder_btn.clicked.connect(self.open_mods_folder)
 
+        top_bar.addWidget(self.resume_mod_btn)
         top_bar.addWidget(self.cancel_mod_btn)
         top_bar.addWidget(self.clear_completed_btn)
         top_bar.addWidget(self.open_mods_folder_btn)
@@ -423,13 +430,29 @@ class DownloadsTabWidget(QWidget):
             task = self.queue_manager.get_task(task_id)
             if task:
                 can_cancel = task.status in [STATE_QUEUED, STATE_GENERATING_URL, STATE_DOWNLOADING]
+                can_resume = task.status in [STATE_ERROR, STATE_CANCELLED]
                 self.cancel_mod_btn.setEnabled(can_cancel)
+                self.resume_mod_btn.setEnabled(can_resume)
                 if task.status == STATE_ERROR and task.error_message:
                     self.mods_status_label.setText(f"Ошибка #{task.task_id}: {task.error_message}")
                 elif task.status == STATE_COMPLETED and task.saved_path:
                     self.mods_status_label.setText(f"Сохранено: {task.saved_path}")
+                elif task.status == STATE_DOWNLOADING:
+                    self.mods_status_label.setText(f"Скачивание: {task.title} ({task.speed_str})")
                 return
         self.cancel_mod_btn.setEnabled(False)
+        self.resume_mod_btn.setEnabled(False)
+
+    def resume_selected_mod(self):
+        task_id = self._get_selected_task_id()
+        if not task_id:
+            return
+        task = self.queue_manager.get_task(task_id)
+        if not task:
+            return
+        if self.queue_manager.retry_task(task_id):
+            self.mods_status_label.setText(f"Загрузка '{task.title}' (#{task.task_id}) возвращена в очередь для докачки")
+            self._on_mod_selection_changed()
 
     def _on_mod_double_clicked(self, row: int, column: int):
         task_id = self._get_selected_task_id()

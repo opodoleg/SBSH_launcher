@@ -1176,19 +1176,43 @@ class NexusAPI:
         save_dir: Optional[str] = None,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         cancel_flag: Optional[Callable[[], bool]] = None,
+        initial_file_name: Optional[str] = None,
+        allow_resume: bool = True,
+        status_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
         """
-        Скачивает файл с прогресс-баром и сохраняет в указанную папку:
-        - Получает прямую ссылку через get_download_url
-        - Выполняет потоковую загрузку чанками
-        - Вызывает progress_callback(downloaded_bytes, total_bytes, speed_str)
+        Скачивает файл с поддержкой докачки (HTTP Range / 206 Partial Content),
+        прогресс-баром и автоматической сортировкой по расширениям:
+        - Проверяет частичный файл (.part) и запрашивает докачку через Range: bytes=...
+        - Если сервер вернул 206 Partial Content, дописывает в файл (режим 'ab')
+        - Если сервер не поддерживает докачку (HTTP 200), начинает заново ('wb') с уведомлением
+        - При ошибке или обрыве сети сохраняет .part на диске для последующего возобновления
+        - Направляет файл в соответствующую подпапку через DownloadRouter
         - Возвращает абсолютный путь к сохранённому файлу
         """
         gid = game_id if game_id is not None else self.game_id
         domain = game_domain or self.game_domain
 
-        target_dir = save_dir or os.getenv("MODS_FOLDER") or os.path.join(os.getcwd(), "downloads", "mods")
+        base_target_dir = save_dir or os.getenv("MODS_FOLDER") or os.path.join(os.getcwd(), "downloads", "mods")
+
+        # Определяем предварительную целевую папку и путь к .part файлу
+        target_dir = base_target_dir
+        if initial_file_name:
+            try:
+                from modules.download_router import download_router
+                target_dir = download_router.get_destination_dir(base_target_dir, initial_file_name, domain)
+            except Exception:
+                target_dir = base_target_dir
+
         os.makedirs(target_dir, exist_ok=True)
+
+        candidate_part: Optional[str] = None
+        existing_bytes = 0
+        if initial_file_name and allow_resume:
+            cand = os.path.join(target_dir, initial_file_name + ".part")
+            if os.path.exists(cand) and os.path.getsize(cand) > 0:
+                candidate_part = cand
+                existing_bytes = os.path.getsize(cand)
 
         print(f"[NexusAPI] Запрос прямой ссылки для file_id={file_id} (game_id={gid})...")
         download_url = self.get_download_url(
@@ -1200,11 +1224,34 @@ class NexusAPI:
 
         print(f"[NexusAPI] Прямая ссылка получена! Запуск загрузки...")
 
-        # Используем независимую сессию для скачивания, чтобы не блокировать и не вызывать race condition
         dl_session = self.create_session()
-        resp = dl_session.get(download_url, stream=True, timeout=30)
+        headers = {}
+
+        if existing_bytes > 0:
+            headers["Range"] = f"bytes={existing_bytes}-"
+            print(f"[NexusAPI] Обнаружен незавершённый файл ({format_bytes(existing_bytes)}). Запрос докачки: Range: bytes={existing_bytes}-")
+            if status_callback:
+                status_callback(f"Запрос докачки с {format_bytes(existing_bytes)}...")
+
+        resp = dl_session.get(download_url, stream=True, headers=headers, timeout=35)
+
+        # Обработка ошибки 416 (Range Not Satisfiable) — если частичный файл уже полон или поврежден
+        if resp.status_code == 416:
+            print(f"[NexusAPI] HTTP 416: Недопустимый диапазон. Сброс частичного файла и начало с 0...")
+            if candidate_part and os.path.exists(candidate_part):
+                try:
+                    os.remove(candidate_part)
+                except Exception:
+                    pass
+            existing_bytes = 0
+            candidate_part = None
+            if status_callback:
+                status_callback("Диапазон недопустим, скачивание заново...")
+            resp = dl_session.get(download_url, stream=True, timeout=35)
+
         resp.raise_for_status()
 
+        # Определение истинного имени файла (Content-Disposition или URL)
         filename = None
         cd_header = resp.headers.get("content-disposition", "")
         if cd_header:
@@ -1213,59 +1260,113 @@ class NexusAPI:
                 filename = urllib.parse.unquote(fn_match.group(1).strip())
 
         if not filename:
-            url_path = urllib.parse.urlparse(download_url).path
-            base_name = os.path.basename(url_path)
-            if base_name and "." in base_name:
-                filename = urllib.parse.unquote(base_name)
+            if initial_file_name:
+                filename = initial_file_name
             else:
-                filename = f"nexus_{domain}_{file_id}.zip"
+                url_path = urllib.parse.urlparse(download_url).path
+                base_name = os.path.basename(url_path)
+                if base_name and "." in base_name:
+                    filename = urllib.parse.unquote(base_name)
+                else:
+                    filename = f"nexus_{domain}_{file_id}.zip"
+
+        # Финальная маршрутизация файла по расширению через DownloadRouter
+        try:
+            from modules.download_router import download_router
+            target_dir = download_router.get_destination_dir(base_target_dir, filename, domain)
+        except Exception:
+            target_dir = base_target_dir
+        os.makedirs(target_dir, exist_ok=True)
 
         final_path = os.path.join(target_dir, filename)
         temp_path = final_path + ".part"
 
-        total_bytes = int(resp.headers.get("content-length", 0))
-        downloaded = 0
+        # Если файл был в candidate_part, но путь temp_path отличается, перемещаем его
+        if candidate_part and os.path.exists(candidate_part) and candidate_part != temp_path:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                os.rename(candidate_part, temp_path)
+            except Exception as move_err:
+                print(f"[NexusAPI] Ошибка перемещения частичного файла: {move_err}")
+
+        # Проверка ответа: поддержал ли сервер докачку (HTTP 206)
+        if resp.status_code == 206:
+            file_mode = "ab"
+            downloaded = existing_bytes
+
+            content_range = resp.headers.get("content-range", "")
+            cr_match = re.search(r"/(\d+)", content_range) if content_range else None
+            if cr_match:
+                total_bytes = int(cr_match.group(1))
+            else:
+                content_len = int(resp.headers.get("content-length", 0))
+                total_bytes = existing_bytes + content_len
+
+            pct = f" ({int((downloaded / total_bytes) * 100)}%)" if total_bytes > 0 else ""
+            print(f"[NexusAPI] Сервер поддерживает докачку (HTTP 206)! Возобновление с {format_bytes(existing_bytes)} из {format_bytes(total_bytes)}{pct}")
+            if status_callback:
+                status_callback(f"Докачка с {format_bytes(existing_bytes)} из {format_bytes(total_bytes)}")
+            if progress_callback:
+                progress_callback(downloaded, total_bytes, "Докачка...")
+        else:
+            # Статус 200: сервер не поддерживает докачку (или запрос был без Range)
+            if existing_bytes > 0:
+                print(f"[NexusAPI] Сервер не поддерживает докачку (HTTP 200). Загрузка начата заново с 0 Б.")
+                if status_callback:
+                    status_callback("Сервер не поддерживает докачку, скачивание с начала")
+            file_mode = "wb"
+            downloaded = 0
+            existing_bytes = 0
+            total_bytes = int(resp.headers.get("content-length", 0))
+
+        chunk_size = 128 * 1024
+        session_downloaded = 0
         start_time = time.time()
         last_update_time = start_time
 
-        chunk_size = 128 * 1024
+        try:
+            with open(temp_path, file_mode) as f:
+                for chunk in resp.iter_content(chunk_size=chunk_size):
+                    if cancel_flag and cancel_flag():
+                        f.flush()
+                        print(f"\n[NexusAPI] Загрузка остановлена пользователем. Частичный файл сохранён: {temp_path} ({format_bytes(downloaded)})")
+                        raise RuntimeError("Загрузка остановлена пользователем.")
 
-        with open(temp_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                if cancel_flag and cancel_flag():
-                    print("\n[NexusAPI] Загрузка отменена пользователем.")
-                    try:
-                        os.remove(temp_path)
-                    except Exception:
-                        pass
-                    raise RuntimeError("Загрузка отменена пользователем.")
+                    if chunk:
+                        f.write(chunk)
+                        chunk_len = len(chunk)
+                        downloaded += chunk_len
+                        session_downloaded += chunk_len
 
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
+                        now = time.time()
+                        if now - last_update_time >= 0.25 or (total_bytes > 0 and downloaded >= total_bytes):
+                            elapsed = now - start_time
+                            speed = session_downloaded / elapsed if elapsed > 0 else 0
+                            speed_str = f"{format_bytes(int(speed))}/с"
 
-                    now = time.time()
-                    if now - last_update_time >= 0.2 or downloaded == total_bytes:
-                        elapsed = now - start_time
-                        speed = downloaded / elapsed if elapsed > 0 else 0
-                        speed_str = f"{format_bytes(int(speed))}/с"
-
-                        if progress_callback:
-                            progress_callback(downloaded, total_bytes, speed_str)
-                        else:
-                            if total_bytes > 0:
-                                percent = (downloaded / total_bytes) * 100
-                                bar_len = 30
-                                filled = int(bar_len * downloaded / total_bytes)
-                                bar = "=" * filled + ">" + " " * (bar_len - filled - 1) if filled < bar_len else "=" * bar_len
-                                sys.stdout.write(
-                                    f"\r[{bar}] {percent:5.1f}% ({format_bytes(downloaded)} / {format_bytes(total_bytes)}) {speed_str}   "
-                                )
+                            if progress_callback:
+                                progress_callback(downloaded, total_bytes, speed_str)
                             else:
-                                sys.stdout.write(f"\rСкачано: {format_bytes(downloaded)} [{speed_str}]   ")
-                            sys.stdout.flush()
+                                if total_bytes > 0:
+                                    percent = (downloaded / total_bytes) * 100
+                                    bar_len = 30
+                                    filled = int(bar_len * downloaded / total_bytes)
+                                    bar = "=" * filled + ">" + " " * (bar_len - filled - 1) if filled < bar_len else "=" * bar_len
+                                    sys.stdout.write(
+                                        f"\r[{bar}] {percent:5.1f}% ({format_bytes(downloaded)} / {format_bytes(total_bytes)}) {speed_str}   "
+                                    )
+                                else:
+                                    sys.stdout.write(f"\rСкачано: {format_bytes(downloaded)} [{speed_str}]   ")
+                                sys.stdout.flush()
 
-                        last_update_time = now
+                            last_update_time = now
+                f.flush()
+        except Exception as net_err:
+            if cancel_flag and cancel_flag():
+                raise
+            print(f"\n[NexusAPI] Ошибка соединения при скачивании ({net_err}). Файл сохранён до {format_bytes(downloaded)} в {temp_path}")
+            raise
 
         if not progress_callback:
             sys.stdout.write("\n")
