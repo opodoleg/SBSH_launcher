@@ -416,6 +416,26 @@ class InstalledModsManager(QObject):
             self.mods_updated.emit()
         return removed
 
+    def clean_duplicate_mods(
+        self,
+        dry_run: bool = False,
+        retention_policy: str = "game_dir_first",
+        custom_dirs: Optional[List[str]] = None,
+        log_callback: Optional[Callable[[str], None]] = None,
+    ):
+        """
+        Выполняет комплексный поиск и автоматическую очистку дубликатов модов
+        (archive/pc/mod, r6, bin, mods, downloads) с безопасным сохранением
+        одного основного экземпляра и формированием детального отчёта.
+        """
+        from modules.duplicate_cleaner import duplicate_mod_cleaner
+        return duplicate_mod_cleaner.execute_cleanup(
+            dry_run=dry_run,
+            retention_policy=retention_policy,
+            custom_dirs=custom_dirs,
+            log_callback=log_callback,
+        )
+
     # =========================================================================
     # СКАНИРОВАНИЕ И СИНХРОНИЗАЦИЯ ИГРОВЫХ ДИРЕКТОРИЙ
     # =========================================================================

@@ -8,8 +8,10 @@ from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -21,6 +23,7 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -103,6 +106,219 @@ class QBTFetchWorker(QThread):
                 self.fetch_failed.emit(f"HTTP статус: {r.status_code}")
         except Exception as e:
             self.fetch_failed.emit(str(e))
+
+
+
+class DuplicateCleanupReportDialog(QDialog):
+    """Диалоговое окно отчёта об обнаруженных и удалённых дубликатах модов."""
+
+    def __init__(self, report, parent=None):
+        super().__init__(parent)
+        self.report = report
+        self.setWindowTitle(
+            f"Отчёт об очистке дубликатов модов [{'Предпросмотр' if report.is_dry_run else 'Завершено'}]"
+        )
+        self.resize(940, 620)
+        self.setMinimumSize(720, 460)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #0b1120;
+                color: #f8fafc;
+            }
+            QLabel {
+                color: #e2e8f0;
+            }
+            QPushButton {
+                background-color: #1e293b;
+                color: #f8fafc;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                padding: 6px 14px;
+                font-size: 12px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                border-color: #64748b;
+            }
+            QTableWidget {
+                background-color: #0f172a;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                gridline-color: #1e293b;
+                color: #f8fafc;
+            }
+            QHeaderView::section {
+                background-color: #1e293b;
+                color: #94a3b8;
+                padding: 6px 8px;
+                border: none;
+                font-weight: bold;
+            }
+            QLineEdit {
+                background-color: #0f172a;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                color: #f8fafc;
+                padding: 6px 10px;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        # 1. Верхний заголовок и карточки со статистикой
+        header_row = QHBoxLayout()
+        title_lbl = QLabel(
+            "🧹 <b>Результаты очистки дубликатов модов</b>"
+            if not report.is_dry_run else
+            "🔍 <b>Предпросмотр очистки дубликатов модов (Dry-Run)</b>"
+        )
+        title_lbl.setStyleSheet("font-size: 16px; color: #38bdf8;")
+        header_row.addWidget(title_lbl)
+        header_row.addStretch(1)
+
+        time_lbl = QLabel(f"📅 {report.timestamp}")
+        time_lbl.setStyleSheet("color: #64748b; font-size: 12px;")
+        header_row.addWidget(time_lbl)
+        layout.addLayout(header_row)
+
+        # Карточки сводки
+        cards_layout = QHBoxLayout()
+        cards_layout.setSpacing(10)
+
+        def _make_badge(label: str, val: str, bg: str, fg: str):
+            w = QWidget()
+            w.setStyleSheet(f"background-color: {bg}; border-radius: 8px; border: 1px solid #334155;")
+            vl = QVBoxLayout(w)
+            vl.setContentsMargins(12, 8, 12, 8)
+            vl.setSpacing(2)
+            t_lbl = QLabel(label)
+            t_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            v_lbl = QLabel(val)
+            v_lbl.setStyleSheet(f"color: {fg}; font-size: 16px; font-weight: bold;")
+            vl.addWidget(t_lbl)
+            vl.addWidget(v_lbl)
+            return w
+
+        cards_layout.addWidget(_make_badge("Проверено файлов", str(report.total_scanned_files), "#1e293b", "#38bdf8"))
+        cards_layout.addWidget(_make_badge("Групп дубликатов", str(report.total_duplicate_groups), "#1e293b", "#f59e0b"))
+        count_lbl = "Удалено копий" if not report.is_dry_run else "К удалению"
+        count_val = str(report.total_duplicates_removed if not report.is_dry_run else report.total_duplicates_found)
+        cards_layout.addWidget(_make_badge(count_lbl, count_val, "#1e293b", "#ef4444" if not report.is_dry_run else "#f59e0b"))
+        freed_lbl = "Освобождено" if not report.is_dry_run else "Будет освобождено"
+        cards_layout.addWidget(_make_badge(freed_lbl, report.freed_human, "#064e3b", "#34d399"))
+        layout.addLayout(cards_layout)
+
+        # 2. Поле фильтрации
+        filter_row = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("🔎 Поиск в отчёте по имени файла или пути...")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self._filter_table)
+        filter_row.addWidget(self.search_input)
+        layout.addLayout(filter_row)
+
+        # 3. Таблица дубликатов
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels([
+            "Имя файла", "Размер", "Удалённый дубликат (путь)", "Сохранённый оригинал (путь)", "Причина сохранения"
+        ])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+
+        self._populate_table()
+        layout.addWidget(self.table)
+
+        # 4. Нижняя панель действий
+        bottom_bar = QHBoxLayout()
+        bottom_bar.setSpacing(10)
+
+        self.copy_btn = QPushButton("📋 Скопировать отчёт")
+        self.copy_btn.clicked.connect(self._copy_to_clipboard)
+        bottom_bar.addWidget(self.copy_btn)
+
+        self.open_log_btn = QPushButton("📄 Открыть лог-файл")
+        self.open_log_btn.clicked.connect(self._open_log_file)
+        bottom_bar.addWidget(self.open_log_btn)
+
+        bottom_bar.addStretch(1)
+
+        close_btn = QPushButton("✕ Закрыть")
+        close_btn.setObjectName("accentBtn")
+        close_btn.clicked.connect(self.accept)
+        bottom_bar.addWidget(close_btn)
+
+        layout.addLayout(bottom_bar)
+
+    def _populate_table(self):
+        query = self.search_input.text().strip().lower()
+        self.table.setRowCount(0)
+
+        for item in self.report.removed_files:
+            if query:
+                in_fn = query in item.filename.lower()
+                in_rem = query in item.removed_path.lower()
+                in_kept = query in item.kept_path.lower()
+                if not (in_fn or in_rem or in_kept):
+                    continue
+
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+
+            # 0. Имя файла
+            fn_item = QTableWidgetItem(f"📄 {item.filename}")
+            fn_item.setToolTip(item.filename)
+            self.table.setItem(r, 0, fn_item)
+
+            # 1. Размер
+            sz_item = QTableWidgetItem(item.size_human)
+            sz_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(r, 1, sz_item)
+
+            # 2. Удалённый путь
+            rem_item = QTableWidgetItem(item.removed_path)
+            rem_item.setForeground(QColor("#f87171"))
+            rem_item.setToolTip(f"Удалён: {item.removed_path}\nДата изменения: {item.mtime_removed}")
+            self.table.setItem(r, 2, rem_item)
+
+            # 3. Сохранённый путь
+            kept_item = QTableWidgetItem(item.kept_path)
+            kept_item.setForeground(QColor("#4ade80"))
+            kept_item.setToolTip(f"Сохранён: {item.kept_path}\nДата изменения: {item.mtime_kept}")
+            self.table.setItem(r, 3, kept_item)
+
+            # 4. Причина
+            reason_item = QTableWidgetItem(item.reason)
+            reason_item.setForeground(QColor("#94a3b8"))
+            self.table.setItem(r, 4, reason_item)
+
+    def _filter_table(self):
+        self._populate_table()
+
+    def _copy_to_clipboard(self):
+        cb = QApplication.clipboard()
+        if cb and self.report.report_text:
+            cb.setText(self.report.report_text)
+            QMessageBox.information(self, "Скопировано", "Полный отчёт успешно скопирован в буфер обмена!")
+
+    def _open_log_file(self):
+        if self.report.log_filepath and os.path.exists(self.report.log_filepath):
+            try:
+                os.startfile(self.report.log_filepath)
+            except Exception as e:
+                QMessageBox.warning(self, "Ошибка", f"Не удалось открыть файл лога: {e}")
+        else:
+            QMessageBox.information(self, "Информация", "Файл лога пока не создан на диске.")
 
 
 class DownloadsTabWidget(QWidget):
@@ -593,6 +809,12 @@ class DownloadsTabWidget(QWidget):
         self.clean_missing_btn.clicked.connect(self.clean_missing_installed_mods)
         top_bar.addWidget(self.clean_missing_btn)
 
+        self.clean_duplicates_btn = QPushButton("🗑 Удалить дубликаты")
+        self.clean_duplicates_btn.setObjectName("secondaryBtn")
+        self.clean_duplicates_btn.setToolTip("Интеллектуальный поиск и безопасное удаление дубликатов файлов модов (archive/pc/mod, r6, mods, загрузки) с сохранением основного экземпляра")
+        self.clean_duplicates_btn.clicked.connect(self.clean_duplicate_mods_action)
+        top_bar.addWidget(self.clean_duplicates_btn)
+
         layout.addLayout(top_bar)
 
         # Панель фильтрации
@@ -897,6 +1119,54 @@ class DownloadsTabWidget(QWidget):
                 "Все зарегистрированные моды присутствуют на диске. Очистка не требуется."
             )
         self.refresh_installed_mods_table()
+
+    def clean_duplicate_mods_action(self):
+        """Интеллектуальная комплексная очистка дубликатов файлов модов."""
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Очистка дубликатов модов")
+        msg_box.setText(
+            "<h3>Очистка дубликатов файлов модов</h3>"
+            "<p>Будет выполнено сканирование директории загрузок (mods) и официальных папок игры "
+            "(archive/pc/mod, r6, bin, mods).</p>"
+            "<p><b>Критерии сопоставления и безопасного сохранения:</b><br>"
+            "• При совпадении имени и типа файла (.archive, .reds, .lua, .zip и др.) файлы помечаются как дубликаты.<br>"
+            "• Сохраняется только <b>один основной экземпляр</b> (приоритет у официальной папки игры "
+            "или самого свежего по дате изменения файла).<br>"
+            "• Избыточные дубликаты удаляются для освобождения места и предотвращения конфликтов модов.<br>"
+            "• Подробный отчёт сохраняется в <code>duplicate_cleanup.log</code>.</p>"
+            "<p>Выберите режим выполнения:</p>"
+        )
+        del_btn = msg_box.addButton("🗑 Найти и удалить дубликаты", QMessageBox.ButtonRole.AcceptRole)
+        del_btn.setStyleSheet("background-color: #dc2626; color: white; font-weight: bold; padding: 6px 12px; border-radius: 6px;")
+        dry_btn = msg_box.addButton("🔍 Только предпросмотр (Dry-Run)", QMessageBox.ButtonRole.ActionRole)
+        cancel_btn = msg_box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+
+        msg_box.exec()
+        clicked = msg_box.clickedButton()
+        if clicked == cancel_btn or clicked is None:
+            return
+
+        dry_run = (clicked == dry_btn)
+
+        st = QSettings("SBSH", "Launcher")
+        mods_f = st.value("mods_folder", "") or (self.get_mods_folder_callback() if self.get_mods_folder_callback else "")
+        games_f = st.value("games_save_path", "")
+
+        from modules.duplicate_cleaner import duplicate_mod_cleaner
+        if mods_f:
+            duplicate_mod_cleaner.mods_dir = os.path.abspath(mods_f)
+        if games_f and os.path.isdir(games_f) and games_f not in duplicate_mod_cleaner.custom_game_dirs:
+            duplicate_mod_cleaner.custom_game_dirs.append(os.path.abspath(games_f))
+
+        report = duplicate_mod_cleaner.execute_cleanup(
+            dry_run=dry_run,
+            retention_policy="game_dir_first",
+        )
+
+        self.refresh_installed_mods_table()
+
+        dialog = DuplicateCleanupReportDialog(report, parent=self)
+        dialog.exec()
 
     # =========================================================================
     # ПОДВКЛАДКА 3: QBITTORRENT (ИГРЫ)

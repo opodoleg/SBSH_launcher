@@ -32,6 +32,7 @@ hiddenimports = [
     'modules.installed_mods',
     'modules.downloaded_mods',
     'modules.mod_pipeline',
+    'modules.duplicate_cleaner',
     'modules.download_router',
     'ui',
     'ui.styles',
