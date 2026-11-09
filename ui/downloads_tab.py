@@ -1,13 +1,16 @@
 import os
 import subprocess
 import sys
+import threading
+import webbrowser
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -135,6 +138,22 @@ class DownloadsTabWidget(QWidget):
         # Первичное заполнение таблиц
         self.refresh_mods_table()
         self.refresh_installed_mods_table()
+
+        # Фоновое автосканирование директорий модов и игры при старте
+        self._start_startup_scan()
+
+    def _start_startup_scan(self):
+        """Запускает неблокирующее фоновое сканирование настроенных папок."""
+        def _scan():
+            try:
+                st = QSettings("SBSH", "Launcher")
+                mods_f = st.value("mods_folder", "") or (self.get_mods_folder_callback() if self.get_mods_folder_callback else "")
+                games_f = st.value("games_save_path", "")
+                installed_mods_manager.scan_all_locations(mods_dir=mods_f, games_dir=games_f)
+            except Exception as e:
+                print(f"[DownloadsTabWidget] Ошибка фонового сканирования при старте: {e}")
+
+        threading.Thread(target=_scan, daemon=True, name="StartupModScanner").start()
 
     def _setup_ui(self):
         root_layout = QVBoxLayout(self)
@@ -556,11 +575,17 @@ class DownloadsTabWidget(QWidget):
         self.open_installed_folder_btn.clicked.connect(self.open_mods_folder)
         top_bar.addWidget(self.open_installed_folder_btn)
 
-        self.scan_installed_btn = QPushButton("🔍 Сканировать папку")
+        self.scan_installed_btn = QPushButton("🔍 Сканировать игру и моды")
         self.scan_installed_btn.setObjectName("secondaryBtn")
-        self.scan_installed_btn.setToolTip("Найти ранее скачанные моды и архивы в папке модов")
+        self.scan_installed_btn.setToolTip("Глубокое сканирование папок игры (r6, bin, mods, archive/pc/mod) и каталога загрузок")
         self.scan_installed_btn.clicked.connect(self.scan_installed_folder)
         top_bar.addWidget(self.scan_installed_btn)
+
+        self.scan_custom_folder_btn = QPushButton("📁 Выбрать папку...")
+        self.scan_custom_folder_btn.setObjectName("secondaryBtn")
+        self.scan_custom_folder_btn.setToolTip("Выбрать конкретную директорию игры или модов на диске для глубокого сканирования")
+        self.scan_custom_folder_btn.clicked.connect(self.scan_custom_folder)
+        top_bar.addWidget(self.scan_custom_folder_btn)
 
         self.clean_missing_btn = QPushButton("🧹 Очистить отсутствующие")
         self.clean_missing_btn.setObjectName("secondaryBtn")
@@ -575,7 +600,7 @@ class DownloadsTabWidget(QWidget):
         filter_row.setSpacing(8)
 
         self.installed_search_input = QLineEdit()
-        self.installed_search_input.setPlaceholderText("🔎 Быстрый поиск по названию мода, игре или файлу...")
+        self.installed_search_input.setPlaceholderText("🔎 Поиск по названию мода, типу (Archive, CET, Redscript), игре или файлу...")
         self.installed_search_input.setClearButtonEnabled(True)
         self.installed_search_input.textChanged.connect(self.refresh_installed_mods_table)
         filter_row.addWidget(self.installed_search_input, stretch=3)
@@ -584,6 +609,7 @@ class DownloadsTabWidget(QWidget):
         self.installed_source_combo.addItem("Все источники", "")
         self.installed_source_combo.addItem("🌐 Nexus Mods", "nexus")
         self.installed_source_combo.addItem("⚡ Steam Workshop", "steam")
+        self.installed_source_combo.addItem("💻 Локальные / Игра", "local")
         self.installed_source_combo.currentIndexChanged.connect(self.refresh_installed_mods_table)
         filter_row.addWidget(self.installed_source_combo, stretch=1)
 
@@ -596,9 +622,9 @@ class DownloadsTabWidget(QWidget):
 
         # Таблица установленных модов
         self.installed_table = QTableWidget()
-        self.installed_table.setColumnCount(7)
+        self.installed_table.setColumnCount(8)
         self.installed_table.setHorizontalHeaderLabels([
-            "Название мода", "Игра", "Источник", "Размер", "Дата установки", "Статус", "Путь к файлам"
+            "Название мода", "Тип", "Игра", "Источник", "Размер", "Дата установки", "Статус", "Путь к файлам"
         ])
         self.installed_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.installed_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -611,8 +637,9 @@ class DownloadsTabWidget(QWidget):
         self.installed_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.installed_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.installed_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        self.installed_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
-        self.installed_table.setColumnWidth(6, 260)
+        self.installed_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        self.installed_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Interactive)
+        self.installed_table.setColumnWidth(7, 260)
 
         self.installed_table.itemSelectionChanged.connect(self.on_installed_selection_changed)
         self.installed_table.cellDoubleClicked.connect(self.on_installed_double_clicked)
@@ -659,34 +686,58 @@ class DownloadsTabWidget(QWidget):
         if hasattr(self, "sub_tabs") and self.sub_tabs.count() > 1:
             self.sub_tabs.setTabText(1, f"💾  Установленные моды ({total_count})")
 
+        TYPE_COLORS = {
+            "Archive": "#38bdf8",
+            "CET (Lua)": "#22c55e",
+            "Redscript": "#f59e0b",
+            "TweakXL": "#a855f7",
+            "REDmod": "#ef4444",
+            "Plugin (DLL/ASI)": "#06b6d4",
+            "Steam Workshop": "#60a5fa",
+            "Архив (Zip/7z)": "#94a3b8",
+        }
+
         for row, m in enumerate(mods):
             exists = m.get("exists_on_disk", False)
 
-            # Название
+            # 0. Название
             title_text = m.get("title", "Мод")
             if m.get("is_collection"):
                 title_text = f"📚 {title_text}"
             title_item = QTableWidgetItem(title_text)
             title_item.setData(Qt.ItemDataRole.UserRole, m)
 
-            # Игра
+            # 1. Тип
+            m_type = m.get("mod_type") or "Мод"
+            type_item = QTableWidgetItem(m_type)
+            type_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            c = TYPE_COLORS.get(m_type, "#94a3b8")
+            type_item.setForeground(QColor(c))
+
+            # 2. Игра
             g_name = m.get("game_name") or m.get("game_domain") or "—"
             game_item = QTableWidgetItem(str(g_name))
 
-            # Источник
-            src_str = "Nexus Mods" if m.get("source") == "nexus" else "Steam Workshop"
+            # 3. Источник
+            src = m.get("source", "")
+            if src == "nexus":
+                src_str = "🌐 Nexus Mods"
+            elif src == "steam":
+                src_str = "⚡ Steam Workshop"
+            else:
+                src_str = "💻 Локальный / Игра"
             source_item = QTableWidgetItem(src_str)
             source_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            # Размер
+            # 4. Размер
             size_item = QTableWidgetItem(m.get("size_human", "—"))
             size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-            # Дата
+            # 5. Дата
             date_item = QTableWidgetItem(m.get("installed_at", "—"))
             date_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            # Статус
+            # 6. Статус
             if exists:
                 status_item = QTableWidgetItem("✅ На диске")
                 status_item.setForeground(QColor("#22c55e"))
@@ -695,17 +746,18 @@ class DownloadsTabWidget(QWidget):
                 status_item.setForeground(QColor("#ef4444"))
             status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            # Путь
+            # 7. Путь
             path_item = QTableWidgetItem(m.get("install_path", "—"))
             path_item.setToolTip(m.get("install_path", ""))
 
             self.installed_table.setItem(row, 0, title_item)
-            self.installed_table.setItem(row, 1, game_item)
-            self.installed_table.setItem(row, 2, source_item)
-            self.installed_table.setItem(row, 3, size_item)
-            self.installed_table.setItem(row, 4, date_item)
-            self.installed_table.setItem(row, 5, status_item)
-            self.installed_table.setItem(row, 6, path_item)
+            self.installed_table.setItem(row, 1, type_item)
+            self.installed_table.setItem(row, 2, game_item)
+            self.installed_table.setItem(row, 3, source_item)
+            self.installed_table.setItem(row, 4, size_item)
+            self.installed_table.setItem(row, 5, date_item)
+            self.installed_table.setItem(row, 6, status_item)
+            self.installed_table.setItem(row, 7, path_item)
 
         self.on_installed_selection_changed()
 
@@ -735,7 +787,7 @@ class DownloadsTabWidget(QWidget):
             if hasattr(self, "delete_installed_btn"):
                 self.delete_installed_btn.setEnabled(True)
             if hasattr(self, "installed_selected_info"):
-                self.installed_selected_info.setText(f"<b>{m.get('title')}</b> — {status_text}: {p}")
+                self.installed_selected_info.setText(f"<b>{m.get('title')}</b> [{m.get('mod_type', 'Мод')}] — {status_text}: {p}")
 
     def on_installed_double_clicked(self, row: int, column: int):
         self.show_selected_in_explorer()
@@ -781,31 +833,54 @@ class DownloadsTabWidget(QWidget):
             self.refresh_installed_mods_table()
 
     def scan_installed_folder(self):
-        folder = None
-        if self.get_mods_folder_callback:
-            folder = self.get_mods_folder_callback()
-        if not folder or not os.path.isdir(folder):
-            from PyQt6.QtCore import QSettings
-            folder = QSettings("SBSH", "SteamWorkshopLauncher").value("mods_folder", "")
+        """Комплексное сканирование всех игровых директорий и папок модов."""
+        st = QSettings("SBSH", "Launcher")
+        mods_f = st.value("mods_folder", "") or (self.get_mods_folder_callback() if self.get_mods_folder_callback else "")
+        games_f = st.value("games_save_path", "")
 
-        if not folder or not os.path.isdir(folder):
-            QMessageBox.warning(self, "Внимание", "Папка модов не указана или не существует. Настройте путь во вкладке 'Настройки'.")
-            return
-
-        added = installed_mods_manager.scan_directory(folder)
+        added = installed_mods_manager.scan_all_locations(mods_dir=mods_f, games_dir=games_f)
+        total = len(installed_mods_manager.get_all())
         if added > 0:
             QMessageBox.information(
                 self,
-                "Сканирование завершено",
-                f"Найдено и добавлено в реестр ранее скачанных модов: {added}"
+                "Синхронизация завершена",
+                f"Сканирование завершено!\n\n"
+                f"Обнаружено и синхронизировано новых модов: {added}\n"
+                f"Всего модов в реестре: {total}"
             )
         else:
             QMessageBox.information(
                 self,
                 "Сканирование завершено",
-                "Новых модов или архивов в папке не обнаружено. Все найденные файлы уже учтены."
+                f"Новых модов не обнаружено. Все {total} модов в реестре актуальны."
             )
         self.refresh_installed_mods_table()
+
+    def scan_custom_folder(self):
+        """Выбор конкретной папки на диске для глубокого сканирования."""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Выберите директорию игры или модов для сканирования",
+            os.getcwd()
+        )
+        if folder:
+            added = installed_mods_manager.scan_directory(folder)
+            total = len(installed_mods_manager.get_all())
+            if added > 0:
+                QMessageBox.information(
+                    self,
+                    "Сканирование папки",
+                    f"Сканирование завершено!\n\nПуть: {folder}\n"
+                    f"Обнаружено и синхронизировано модов: {added}\n"
+                    f"Всего в реестре: {total}"
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Сканирование папки",
+                    f"В выбранной папке не найдено новых файлов модов.\nВсего в реестре: {total}"
+                )
+            self.refresh_installed_mods_table()
 
     def clean_missing_installed_mods(self):
         removed = installed_mods_manager.clean_missing()

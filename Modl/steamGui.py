@@ -1587,7 +1587,7 @@ class SteamSearchUI(QWidget):
 
         for mod in mods:
             mid = mod.get("mod_id")
-            installed, inst_data = installed_mods_manager.is_installed("nexus", mid, game_id=gid)
+            installed, inst_data = installed_mods_manager.is_installed("nexus", mid, game_id=gid, title=mod.get("title"))
             badge = "✅ [Установлен] " if installed else ""
             if installed:
                 installed_count += 1
@@ -1916,7 +1916,7 @@ class SteamSearchUI(QWidget):
                 dl_badge = f" &nbsp;|&nbsp; 📥 <b>Скачиваний:</b> {dl:,}" if dl else ""
 
                 gid = self.current_nexus_game.get("game_id")
-                installed, inst_data = installed_mods_manager.is_installed("nexus", mod_id, game_id=gid)
+                installed, inst_data = installed_mods_manager.is_installed("nexus", mod_id, game_id=gid, title=title)
                 self.current_installed_data = inst_data if installed else None
 
                 self.details_title.setText(f"<b>{title}</b>")
@@ -2081,7 +2081,7 @@ class SteamSearchUI(QWidget):
                 installed, _ = installed_mods_manager.is_installed("nexus", slug)
             elif self.source_mode == "nexus":
                 mid = mod.get("mod_id")
-                installed, _ = installed_mods_manager.is_installed("nexus", mid, game_id=gid)
+                installed, _ = installed_mods_manager.is_installed("nexus", mid, game_id=gid, title=mod.get("title"))
             else:
                 mid = mod.get("id")
                 installed, _ = installed_mods_manager.is_installed("steam", mid, game_id=self.current_appid)

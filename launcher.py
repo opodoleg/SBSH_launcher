@@ -237,10 +237,17 @@ class SBSHLauncher(QMainWindow):
 
     def closeEvent(self, event):
         self.settings.setValue("window_geometry", self.saveGeometry())
-        # Безопасное завершение рабочих потоков
+        # Безопасное завершение рабочих потоков и гарантированное сохранение состояния
         if hasattr(self.mods_tab, "stop_workers"):
             self.mods_tab.stop_workers()
-        get_download_queue_manager().stop()
+        queue_mgr = get_download_queue_manager()
+        queue_mgr.save_history()
+        queue_mgr.stop()
+        try:
+            from modules.installed_mods import installed_mods_manager
+            installed_mods_manager.save()
+        except Exception:
+            pass
         event.accept()
 
 

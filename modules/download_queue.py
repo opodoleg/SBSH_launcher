@@ -9,17 +9,25 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
+import json
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
-import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Modl")))
 from Nexus_api import NexusAPI, format_bytes
+
+
+def get_base_dir() -> str:
+    """Возвращает базовую директорию лаунчера, корректно работающую как в скрипте, так и в .exe."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 # Статусы задач
@@ -87,7 +95,7 @@ class DownloadQueueManager(QObject):
     queue_cleared = pyqtSignal()
     active_count_changed = pyqtSignal(int)             # количество незавершённых задач
 
-    def __init__(self, nexus_api: Optional[NexusAPI] = None):
+    def __init__(self, nexus_api: Optional[NexusAPI] = None, history_file: Optional[str] = None):
         super().__init__()
         self._nexus_api = nexus_api
         self._lock = threading.RLock()
@@ -97,6 +105,10 @@ class DownloadQueueManager(QObject):
         self._next_id = 1
         self._current_task: Optional[DownloadTask] = None
         self._is_running = True
+        self._history_file = history_file or os.path.join(get_base_dir(), "download_history.json")
+
+        # Загрузка персистентной истории загрузок
+        self._load_history()
 
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
@@ -104,6 +116,110 @@ class DownloadQueueManager(QObject):
             name="DownloadQueueWorker"
         )
         self._worker_thread.start()
+
+    def _load_history(self):
+        """Загружает сохраненную историю задач из JSON-файла."""
+        with self._lock:
+            if not os.path.exists(self._history_file):
+                return
+            try:
+                with open(self._history_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, list):
+                    return
+
+                max_id = 0
+                for item in data:
+                    tid = item.get("task_id", 0)
+                    if tid > max_id:
+                        max_id = tid
+
+                    st = item.get("status", STATE_QUEUED)
+                    st_text = item.get("status_text", STATUS_LABELS.get(st, st))
+
+                    # Если задача была прервана при закрытии приложения
+                    if st in [STATE_DOWNLOADING, STATE_GENERATING_URL]:
+                        st = STATE_CANCELLED
+                        st_text = "Приостановлено (готово к докачке)"
+
+                    task = DownloadTask(
+                        task_id=tid,
+                        source=item.get("source", "nexus"),
+                        mod_id=item.get("mod_id", 0),
+                        title=item.get("title", ""),
+                        file_name=item.get("file_name", ""),
+                        size_human=item.get("size_human", "—"),
+                        status=st,
+                        status_text=st_text,
+                        progress=item.get("progress", 0),
+                        speed_str="—",
+                        downloaded_bytes=item.get("downloaded_bytes", 0),
+                        total_bytes=item.get("total_bytes", 0),
+                        error_message=item.get("error_message", ""),
+                        saved_path=item.get("saved_path", ""),
+                        file_id=item.get("file_id"),
+                        game_id=item.get("game_id"),
+                        game_domain=item.get("game_domain"),
+                        appid=item.get("appid"),
+                        steamcmd_path=item.get("steamcmd_path"),
+                        save_dir=item.get("save_dir", ""),
+                        created_at=item.get("created_at", time.time()),
+                        is_cancelled=(st == STATE_CANCELLED),
+                    )
+                    self._tasks.append(task)
+                    self._tasks_by_id[tid] = task
+
+                    # Возобновляем невыполненные задачи, стоявшие в очереди
+                    if st == STATE_QUEUED:
+                        self._queue.put(tid)
+
+                self._next_id = max_id + 1
+            except Exception as e:
+                print(f"[DownloadQueueManager] Ошибка чтения {self._history_file}: {e}")
+
+    def save_history(self):
+        """Атомарно сохраняет всю историю и состояние задач в JSON-файл."""
+        with self._lock:
+            temp_path = self._history_file + ".tmp"
+            try:
+                serialized = []
+                for t in self._tasks:
+                    serialized.append({
+                        "task_id": t.task_id,
+                        "source": t.source,
+                        "mod_id": t.mod_id,
+                        "title": t.title,
+                        "file_name": t.file_name,
+                        "size_human": t.size_human,
+                        "status": t.status,
+                        "status_text": t.status_text,
+                        "progress": t.progress,
+                        "speed_str": "—",
+                        "downloaded_bytes": t.downloaded_bytes,
+                        "total_bytes": t.total_bytes,
+                        "error_message": t.error_message,
+                        "saved_path": t.saved_path,
+                        "file_id": t.file_id,
+                        "game_id": t.game_id,
+                        "game_domain": t.game_domain,
+                        "appid": t.appid,
+                        "steamcmd_path": t.steamcmd_path,
+                        "save_dir": t.save_dir,
+                        "created_at": t.created_at,
+                    })
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    json.dump(serialized, f, ensure_ascii=False, indent=2)
+                if os.path.exists(self._history_file):
+                    os.replace(temp_path, self._history_file)
+                else:
+                    os.rename(temp_path, self._history_file)
+            except Exception as e:
+                print(f"[DownloadQueueManager] Ошибка сохранения {self._history_file}: {e}")
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
 
     def _get_nexus_api(self) -> NexusAPI:
         if self._nexus_api is None:
@@ -142,6 +258,7 @@ class DownloadQueueManager(QObject):
             self._tasks.append(task)
             self._tasks_by_id[tid] = task
             self._queue.put(tid)
+            self.save_history()
             self.task_added.emit(task)
             self._notify_active_count()
             return task
@@ -175,6 +292,7 @@ class DownloadQueueManager(QObject):
             self._tasks.append(task)
             self._tasks_by_id[tid] = task
             self._queue.put(tid)
+            self.save_history()
             self.task_added.emit(task)
             self._notify_active_count()
             return task
@@ -199,6 +317,7 @@ class DownloadQueueManager(QObject):
                 except Exception:
                     pass
 
+            self.save_history()
             self.task_updated.emit(task)
             self.task_finished.emit(task.task_id, False, "Отменено пользователем")
             self._notify_active_count()
@@ -220,6 +339,7 @@ class DownloadQueueManager(QObject):
             task.speed_str = "—"
 
             self._queue.put(task_id)
+            self.save_history()
             self.task_updated.emit(task)
             self._notify_active_count()
             return True
@@ -232,6 +352,7 @@ class DownloadQueueManager(QObject):
                 if t.status in [STATE_QUEUED, STATE_GENERATING_URL, STATE_DOWNLOADING]
             ]
             self._tasks_by_id = {t.task_id: t for t in self._tasks}
+            self.save_history()
             self.queue_cleared.emit()
             self._notify_active_count()
 
@@ -266,6 +387,7 @@ class DownloadQueueManager(QObject):
                         self._current_task._cancel_cb()
                     except Exception:
                         pass
+        self.save_history()
 
     # ==========================================
     # ВОРКЕР И ВЫПОЛНЕНИЕ ЗАДАЧ
@@ -304,6 +426,7 @@ class DownloadQueueManager(QObject):
                 with self._lock:
                     self._current_task = None
                 self._queue.task_done()
+                self.save_history()
                 self._notify_active_count()
 
     def _execute_nexus_task(self, task: DownloadTask):
