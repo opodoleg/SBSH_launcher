@@ -6,10 +6,11 @@ import webbrowser
 from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import QSettings, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QCursor, QPixmap
+from PyQt6.QtGui import QColor, QCursor, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -57,6 +58,7 @@ from Nexus_api import (
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from modules.saved_games import saved_games_manager
 from modules.download_queue import get_download_queue_manager
+from modules.installed_mods import installed_mods_manager
 
 
 # ==========================================================
@@ -600,6 +602,10 @@ class SteamSearchUI(QWidget):
         self.download_worker = None
         self.download_thread = None
 
+        # Память об установленных модах
+        self.current_installed_data = None
+        installed_mods_manager.mods_updated.connect(self._refresh_installed_badges_in_list)
+
         self._setup_ui()
         self._setup_timers()
         self._setup_signals()
@@ -795,9 +801,20 @@ class SteamSearchUI(QWidget):
         nexus_sort_layout.addWidget(self.nexus_collection_sort_combo, stretch=1)
         self.nexus_collection_sort_container.setVisible(False)
 
+        mod_search_row = QHBoxLayout()
+        mod_search_row.setSpacing(6)
+
         self.mod_search_input = QLineEdit()
         self.mod_search_input.setPlaceholderText("Поиск модов для выбранной игры...")
         self.mod_search_input.setClearButtonEnabled(True)
+
+        self.filter_only_installed_cb = QCheckBox("✓ Установленные")
+        self.filter_only_installed_cb.setStyleSheet("color: #38bdf8; font-size: 11px;")
+        self.filter_only_installed_cb.setToolTip("Показывать только скачанные и установленные на диске моды")
+        self.filter_only_installed_cb.stateChanged.connect(self._filter_mods_list_installed)
+
+        mod_search_row.addWidget(self.mod_search_input, stretch=1)
+        mod_search_row.addWidget(self.filter_only_installed_cb)
 
         self.mods_list = QListWidget()
         self.mods_list.itemClicked.connect(self.on_mod_selected)
@@ -807,7 +824,7 @@ class SteamSearchUI(QWidget):
         mods_layout.addWidget(self.nexus_type_container)
         mods_layout.addWidget(self.nexus_category_container)
         mods_layout.addWidget(self.nexus_collection_sort_container)
-        mods_layout.addWidget(self.mod_search_input)
+        mods_layout.addLayout(mod_search_row)
         mods_layout.addWidget(self.mods_list)
 
         self.main_splitter.addWidget(mods_container)
@@ -831,8 +848,17 @@ class SteamSearchUI(QWidget):
         # Для обратной совместимости сохраняем ссылку
         self.selected_mod_label = self.details_meta
 
+        self.installed_badge = QLabel()
+        self.installed_badge.setWordWrap(True)
+        self.installed_badge.setStyleSheet(
+            "background-color: #064e3b; color: #34d399; padding: 6px 10px; "
+            "border-radius: 6px; font-size: 11px; font-weight: bold;"
+        )
+        self.installed_badge.setVisible(False)
+
         details_layout.addWidget(self.details_title)
         details_layout.addWidget(self.details_meta)
+        details_layout.addWidget(self.installed_badge)
 
         # Блок скриншотов
         self.screenshots_box = QGroupBox("Скриншоты")
@@ -921,11 +947,23 @@ class SteamSearchUI(QWidget):
         self.browser_button.setEnabled(False)
         self.browser_button.clicked.connect(self.open_mod_workshop)
 
+        self.open_installed_folder_btn = QPushButton("📂 Папка")
+        self.open_installed_folder_btn.setToolTip("Показать файлы мода в проводнике Windows")
+        self.open_installed_folder_btn.setVisible(False)
+        self.open_installed_folder_btn.clicked.connect(self.show_current_mod_in_explorer)
+
+        self.delete_installed_mod_btn = QPushButton("🗑️")
+        self.delete_installed_mod_btn.setToolTip("Удалить установленный мод с диска")
+        self.delete_installed_mod_btn.setVisible(False)
+        self.delete_installed_mod_btn.clicked.connect(self.delete_current_installed_mod)
+
         self.download_button = QPushButton("Скачать выбранный мод через SteamCMD")
         self.download_button.setFixedHeight(36)
         self.download_button.setEnabled(False)
 
         actions_row.addWidget(self.browser_button)
+        actions_row.addWidget(self.open_installed_folder_btn)
+        actions_row.addWidget(self.delete_installed_mod_btn)
         actions_row.addWidget(self.download_button, stretch=1)
         details_layout.addWidget(self.single_mod_actions_container)
 
@@ -955,11 +993,16 @@ class SteamSearchUI(QWidget):
         self.col_browser_btn = QPushButton("🌐 Открыть на Nexus Mods")
         self.col_browser_btn.clicked.connect(self.open_mod_workshop)
 
+        self.col_open_installed_btn = QPushButton("📂 Папка манифеста")
+        self.col_open_installed_btn.setVisible(False)
+        self.col_open_installed_btn.clicked.connect(self.show_current_mod_in_explorer)
+
         self.download_single_col_mod_btn = QPushButton("⬇️ Скачать выбранный мод из коллекции")
         self.download_single_col_mod_btn.setEnabled(False)
         self.download_single_col_mod_btn.clicked.connect(self.download_selected_collection_mod)
 
         c_row2.addWidget(self.col_browser_btn, stretch=1)
+        c_row2.addWidget(self.col_open_installed_btn)
         c_row2.addWidget(self.download_single_col_mod_btn, stretch=2)
 
         col_actions_layout.addLayout(c_row1)
@@ -1495,19 +1538,43 @@ class SteamSearchUI(QWidget):
             return
 
         self.mods_list.clear()
+        only_inst = self.filter_only_installed_cb.isChecked() if hasattr(self, "filter_only_installed_cb") else False
+        installed_count = 0
+
         for mod in mods:
-            item = QListWidgetItem(mod["title"])
+            mid = mod.get("id")
+            installed, inst_data = installed_mods_manager.is_installed("steam", mid, game_id=self.current_appid)
+            badge = "✅ [Установлен] " if installed else ""
+            if installed:
+                installed_count += 1
+
+            item = QListWidgetItem(f"{badge}{mod['title']}")
             item.setData(Qt.ItemDataRole.UserRole, mod)
+            item.setData(Qt.ItemDataRole.UserRole + 1, bool(installed))
+            if installed:
+                item.setForeground(QColor("#22c55e"))
+            if only_inst and not installed:
+                item.setHidden(True)
             self.mods_list.addItem(item)
 
-        self.status_label.setText(f"Загружено модов: {len(mods)}")
+        self.status_label.setText(f"Загружено модов: {len(mods)} (установлено: {installed_count})")
 
     def on_nexus_mods_loaded(self, req_id, mods):
         if req_id != self._mods_req_id:
             return
 
         self.mods_list.clear()
+        only_inst = self.filter_only_installed_cb.isChecked() if hasattr(self, "filter_only_installed_cb") else False
+        installed_count = 0
+        gid = self.current_nexus_game.get("game_id")
+
         for mod in mods:
+            mid = mod.get("mod_id")
+            installed, inst_data = installed_mods_manager.is_installed("nexus", mid, game_id=gid)
+            badge = "✅ [Установлен] " if installed else ""
+            if installed:
+                installed_count += 1
+
             dl_cnt = mod.get("downloads", 0)
             dl_str = f"📥 {dl_cnt:,}" if dl_cnt else ""
             cat = mod.get("category", "")
@@ -1516,19 +1583,34 @@ class SteamSearchUI(QWidget):
 
             parts = [p for p in [cat_str + mod['title'], dl_str, author_str] if p]
             item_text = "  |  ".join(parts) if len(parts) > 1 else parts[0]
+            item_text = f"{badge}{item_text}"
 
             item = QListWidgetItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, mod)
+            item.setData(Qt.ItemDataRole.UserRole + 1, bool(installed))
+            if installed:
+                item.setForeground(QColor("#22c55e"))
+            if only_inst and not installed:
+                item.setHidden(True)
             self.mods_list.addItem(item)
 
-        self.status_label.setText(f"Nexus Mods: найдено {len(mods)} модов")
+        self.status_label.setText(f"Nexus Mods: найдено {len(mods)} модов (установлено: {installed_count})")
 
     def on_nexus_collections_loaded(self, req_id, collections):
         if req_id != self._mods_req_id:
             return
 
         self.mods_list.clear()
+        only_inst = self.filter_only_installed_cb.isChecked() if hasattr(self, "filter_only_installed_cb") else False
+        installed_count = 0
+
         for col in collections:
+            slug = col.get("slug")
+            installed, inst_data = installed_mods_manager.is_installed("nexus", slug)
+            badge = "✅ [Установлена] " if installed else ""
+            if installed:
+                installed_count += 1
+
             cnt = col.get("mod_count", 0)
             sz = col.get("total_size_human", "—")
             dl = col.get("downloads", 0)
@@ -1543,11 +1625,18 @@ class SteamSearchUI(QWidget):
             line2 = "  |  ".join(stats) if stats else ""
 
             item_text = f"{line1}\n{line2}" if line2 else line1
+            item_text = f"{badge}{item_text}"
+
             item = QListWidgetItem(item_text)
             item.setData(Qt.ItemDataRole.UserRole, col)
+            item.setData(Qt.ItemDataRole.UserRole + 1, bool(installed))
+            if installed:
+                item.setForeground(QColor("#22c55e"))
+            if only_inst and not installed:
+                item.setHidden(True)
             self.mods_list.addItem(item)
 
-        self.status_label.setText(f"Nexus Mods: найдено {len(collections)} коллекций")
+        self.status_label.setText(f"Nexus Mods: найдено {len(collections)} коллекций (установлено: {installed_count})")
 
     def on_mod_selected(self, item):
         data = item.data(Qt.ItemDataRole.UserRole)
@@ -1809,11 +1898,29 @@ class SteamSearchUI(QWidget):
                 dl = self.current_mod.get("downloads", 0)
                 dl_badge = f" &nbsp;|&nbsp; 📥 <b>Скачиваний:</b> {dl:,}" if dl else ""
 
+                gid = self.current_nexus_game.get("game_id")
+                installed, inst_data = installed_mods_manager.is_installed("nexus", mod_id, game_id=gid)
+                self.current_installed_data = inst_data if installed else None
+
                 self.details_title.setText(f"<b>{title}</b>")
                 self.details_meta.setText(f"👤 <b>Автор:</b> {author}{cat_badge}{dl_badge} &nbsp;|&nbsp; <b>ID:</b> {mod_id}")
                 self.description_box.setVisible(True)
                 self.download_button.setEnabled(True)
                 self.browser_button.setEnabled(True)
+
+                if installed and inst_data:
+                    p = inst_data.get("install_path", "")
+                    t = inst_data.get("installed_at", "")
+                    self.installed_badge.setText(f"✅ Мод скачан и сохранён на диске (дата: {t})\n📂 Путь: {p}")
+                    self.installed_badge.setVisible(True)
+                    self.open_installed_folder_btn.setVisible(True)
+                    self.delete_installed_mod_btn.setVisible(True)
+                    self.download_button.setText("🔄 Скачать заново / Обновить")
+                else:
+                    self.installed_badge.setVisible(False)
+                    self.open_installed_folder_btn.setVisible(False)
+                    self.delete_installed_mod_btn.setVisible(False)
+                    self.download_button.setText("⚡ Скачать выбранный мод с Nexus Mods")
             else:
                 self.details_title.setText("<i>Выберите мод из списка</i>")
                 self.details_meta.setText("Выберите игру слева и мод в центре для просмотра описания и скриншотов.")
@@ -1821,6 +1928,9 @@ class SteamSearchUI(QWidget):
                 self.screenshots_box.setVisible(False)
                 self.download_button.setEnabled(False)
                 self.browser_button.setEnabled(False)
+                self.installed_badge.setVisible(False)
+                self.open_installed_folder_btn.setVisible(False)
+                self.delete_installed_mod_btn.setVisible(False)
                 self.clear_screenshots()
             return
 
@@ -1828,6 +1938,9 @@ class SteamSearchUI(QWidget):
         if self.current_mod:
             title = self.current_mod.get("title", "Без названия")
             mod_id = self.current_mod.get("id", "N/A")
+            installed, inst_data = installed_mods_manager.is_installed("steam", mod_id, game_id=self.current_appid)
+            self.current_installed_data = inst_data if installed else None
+
             self.details_title.setText(f"<b>{title}</b>")
             self.details_meta.setText(f"<b>Steam Workshop ID:</b> {mod_id} &nbsp;|&nbsp; <b>AppID:</b> {self.current_appid}")
             self.description_box.setVisible(True)
@@ -1840,6 +1953,20 @@ class SteamSearchUI(QWidget):
             )
             self.download_button.setEnabled(True)
             self.browser_button.setEnabled(True)
+
+            if installed and inst_data:
+                p = inst_data.get("install_path", "")
+                t = inst_data.get("installed_at", "")
+                self.installed_badge.setText(f"✅ Мод установлен на диске (дата: {t})\n📂 Путь: {p}")
+                self.installed_badge.setVisible(True)
+                self.open_installed_folder_btn.setVisible(True)
+                self.delete_installed_mod_btn.setVisible(True)
+                self.download_button.setText("🔄 Перекачать через SteamCMD")
+            else:
+                self.installed_badge.setVisible(False)
+                self.open_installed_folder_btn.setVisible(False)
+                self.delete_installed_mod_btn.setVisible(False)
+                self.download_button.setText("⚡ Скачать выбранный мод через SteamCMD")
         else:
             self.details_title.setText("<i>Выберите мод из списка</i>")
             self.details_meta.setText("Выберите игру и мод для просмотра информации.")
@@ -1847,6 +1974,9 @@ class SteamSearchUI(QWidget):
             self.screenshots_box.setVisible(False)
             self.download_button.setEnabled(False)
             self.browser_button.setEnabled(False)
+            self.installed_badge.setVisible(False)
+            self.open_installed_folder_btn.setVisible(False)
+            self.delete_installed_mod_btn.setVisible(False)
             self.clear_screenshots()
 
     # ==========================================
@@ -1872,6 +2002,10 @@ class SteamSearchUI(QWidget):
         end = c.get("endorsements", 0)
         summary = c.get("summary", "")
 
+        slug = c.get("slug")
+        installed, inst_data = installed_mods_manager.is_installed("nexus", slug)
+        self.current_installed_data = inst_data if installed else None
+
         self.details_title.setText(f"<b>📚 {name}</b>")
         self.details_meta.setText(
             f"👤 <b>Куратор:</b> {user} &nbsp;|&nbsp; "
@@ -1893,6 +2027,111 @@ class SteamSearchUI(QWidget):
         self.download_col_manifest_btn.setEnabled(False)
         self.download_single_col_mod_btn.setEnabled(False)
         self.col_browser_btn.setEnabled(True)
+
+        if installed and inst_data:
+            p = inst_data.get("install_path", "")
+            t = inst_data.get("installed_at", "")
+            self.installed_badge.setText(f"✅ Манифест коллекции скачан на диск (дата: {t})\n📂 Путь: {p}")
+            self.installed_badge.setVisible(True)
+            self.col_open_installed_btn.setVisible(True)
+        else:
+            self.installed_badge.setVisible(False)
+            self.col_open_installed_btn.setVisible(False)
+
+    def _filter_mods_list_installed(self):
+        """Фильтрует видимость модов в списке по признаку установки."""
+        only_installed = self.filter_only_installed_cb.isChecked() if hasattr(self, "filter_only_installed_cb") else False
+        for i in range(self.mods_list.count()):
+            item = self.mods_list.item(i)
+            is_inst = item.data(Qt.ItemDataRole.UserRole + 1)
+            item.setHidden(bool(only_installed and not is_inst))
+
+    def _refresh_installed_badges_in_list(self):
+        """Обновляет бейджи [✓ Установлен] и цвет в текущем списке модов."""
+        if not hasattr(self, "mods_list"):
+            return
+        only_inst = self.filter_only_installed_cb.isChecked() if hasattr(self, "filter_only_installed_cb") else False
+        gid = self.current_nexus_game.get("game_id") if self.source_mode == "nexus" else self.current_appid
+
+        for i in range(self.mods_list.count()):
+            item = self.mods_list.item(i)
+            mod = item.data(Qt.ItemDataRole.UserRole)
+            if not mod:
+                continue
+
+            if getattr(self, "nexus_type", "mods") == "collections" and self.source_mode == "nexus":
+                slug = mod.get("slug")
+                installed, _ = installed_mods_manager.is_installed("nexus", slug)
+            elif self.source_mode == "nexus":
+                mid = mod.get("mod_id")
+                installed, _ = installed_mods_manager.is_installed("nexus", mid, game_id=gid)
+            else:
+                mid = mod.get("id")
+                installed, _ = installed_mods_manager.is_installed("steam", mid, game_id=self.current_appid)
+
+            item.setData(Qt.ItemDataRole.UserRole + 1, bool(installed))
+            text = item.text()
+            has_badge = text.startswith("✅ [Установлен] ") or text.startswith("✅ [Установлена] ")
+
+            if installed:
+                item.setForeground(QColor("#22c55e"))
+                if not has_badge:
+                    b_prefix = "✅ [Установлена] " if getattr(self, "nexus_type", "mods") == "collections" else "✅ [Установлен] "
+                    item.setText(f"{b_prefix}{text}")
+            else:
+                item.setForeground(QColor("#e2e8f0"))
+                if has_badge:
+                    clean = text.replace("✅ [Установлен] ", "").replace("✅ [Установлена] ", "")
+                    item.setText(clean)
+
+            if only_inst:
+                item.setHidden(not bool(installed))
+            else:
+                item.setHidden(False)
+
+        if self.current_mod or self.current_collection:
+            self._update_selected_mod_info()
+
+    def show_current_mod_in_explorer(self):
+        inst = getattr(self, "current_installed_data", None)
+        if not inst:
+            return
+        path = inst.get("install_path")
+        if not path:
+            return
+        clean = os.path.abspath(path)
+        if os.name == "nt":
+            if os.path.exists(clean):
+                import subprocess
+                subprocess.run(f'explorer /select,"{clean}"', shell=True)
+            else:
+                QMessageBox.warning(self, "Внимание", f"Файл не найден на диске:\n{clean}")
+        else:
+            if os.path.exists(clean):
+                import webbrowser
+                parent = os.path.dirname(clean) if os.path.isfile(clean) else clean
+                webbrowser.open(parent)
+
+    def delete_current_installed_mod(self):
+        inst = getattr(self, "current_installed_data", None)
+        if not inst:
+            return
+        title = inst.get("title", "Мод")
+        path = inst.get("install_path", "")
+        key = inst.get("key") or inst.get("mod_id")
+
+        reply = QMessageBox.question(
+            self,
+            "Удаление мода",
+            f"Вы уверены, что хотите удалить мод с диска?\n\n<b>{title}</b>\n\nПуть: {path}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            success, msg = installed_mods_manager.unregister_mod(key, delete_files=True)
+            if not success and msg:
+                QMessageBox.warning(self, "Предупреждение", f"Не удалось удалить файлы: {msg}")
+            self._update_selected_mod_info()
+            self._refresh_installed_badges_in_list()
 
     def clear_collection_details(self):
         self.current_collection_details = None
@@ -2188,6 +2427,23 @@ class SteamSearchUI(QWidget):
                     for chunk in resp.iter_content(chunk_size=64 * 1024):
                         if chunk:
                             f.write(chunk)
+
+                # Регистрация манифеста в установленных модах
+                try:
+                    from modules.installed_mods import installed_mods_manager
+                    installed_mods_manager.register_mod(
+                        source="nexus",
+                        mod_id=col_slug,
+                        title=f"Коллекция: {col_name} (Rev #{rev})",
+                        install_path=target_path,
+                        game_domain=self.current_nexus_game["domain"],
+                        file_name=safe_name,
+                        version=f"rev_{rev}",
+                        is_collection=True,
+                    )
+                except Exception:
+                    pass
+
                 QMessageBox.information(
                     self,
                     "Манифест скачан",

@@ -347,6 +347,24 @@ class DownloadQueueManager(QObject):
             task.progress = 100
             task.speed_str = "—"
             task.saved_path = saved_path
+
+            # Автоматическая регистрация в памяти установленных модов
+            try:
+                from modules.installed_mods import installed_mods_manager
+                installed_mods_manager.register_mod(
+                    source="nexus",
+                    mod_id=task.mod_id,
+                    title=task.title,
+                    install_path=saved_path,
+                    game_id=task.game_id,
+                    game_domain=task.game_domain or "",
+                    file_id=task.file_id,
+                    file_name=task.file_name or os.path.basename(saved_path),
+                    size_human=task.size_human,
+                )
+            except Exception as reg_err:
+                print(f"Ошибка регистрации установленного мода Nexus: {reg_err}")
+
             self.task_updated.emit(task)
             self.task_finished.emit(task.task_id, True, saved_path)
 
@@ -476,6 +494,22 @@ class DownloadQueueManager(QObject):
             task.status_text = STATUS_LABELS[STATE_COMPLETED]
             task.progress = 100
             task.saved_path = dest_dir
+
+            # Автоматическая регистрация в памяти установленных модов
+            try:
+                from modules.installed_mods import installed_mods_manager
+                installed_mods_manager.register_mod(
+                    source="steam",
+                    mod_id=task.mod_id,
+                    title=task.title,
+                    install_path=dest_dir,
+                    game_id=task.appid,
+                    file_name=os.path.basename(dest_dir),
+                    size_human=task.size_human,
+                )
+            except Exception as reg_err:
+                print(f"Ошибка регистрации установленного мода Steam: {reg_err}")
+
             self.task_updated.emit(task)
             self.task_finished.emit(task.task_id, True, dest_dir)
         except Exception as e:

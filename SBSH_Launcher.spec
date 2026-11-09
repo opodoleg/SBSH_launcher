@@ -29,6 +29,7 @@ hiddenimports = [
     'modules.favorites',
     'modules.saved_games',
     'modules.download_queue',
+    'modules.installed_mods',
     'ui',
     'ui.styles',
     'ui.games_tab',

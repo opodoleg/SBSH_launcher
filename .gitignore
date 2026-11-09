@@ -8,5 +8,7 @@ dist/
 mods/
 downloads/
 favorites.json
+installed_mods.json
+saved_games.json
 *.log
 

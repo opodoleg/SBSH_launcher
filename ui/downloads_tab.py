@@ -1,12 +1,17 @@
 import os
+import subprocess
 import sys
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QCheckBox,
+    QComboBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -29,6 +34,7 @@ from modules.download_queue import (
     STATE_QUEUED,
     get_download_queue_manager,
 )
+from modules.installed_mods import installed_mods_manager
 
 
 def format_bytes(size_bytes: int) -> str:
@@ -117,12 +123,18 @@ class DownloadsTabWidget(QWidget):
         # Менеджер очереди загрузки модов
         self.queue_manager = get_download_queue_manager()
 
+        # Состояние установленных модов
+        self.installed_mods = []
+        self.selected_installed_mod = None
+
         self._setup_ui()
         self._setup_queue_signals()
+        self._setup_installed_signals()
         self._setup_torrents_timer()
 
-        # Первичное заполнение таблицы модов из очереди
+        # Первичное заполнение таблиц
         self.refresh_mods_table()
+        self.refresh_installed_mods_table()
 
     def _setup_ui(self):
         root_layout = QVBoxLayout(self)
@@ -135,9 +147,14 @@ class DownloadsTabWidget(QWidget):
         # 1. Вкладка "Очередь модов"
         self.mods_tab = QWidget()
         self._setup_mods_ui(self.mods_tab)
-        self.sub_tabs.addTab(self.mods_tab, "📦  Моды (Steam & Nexus Mods)")
+        self.sub_tabs.addTab(self.mods_tab, "📦  Очередь загрузок")
 
-        # 2. Вкладка "Торренты игр"
+        # 2. Вкладка "Установленные моды"
+        self.installed_tab = QWidget()
+        self._setup_installed_mods_ui(self.installed_tab)
+        self.sub_tabs.addTab(self.installed_tab, "💾  Установленные моды")
+
+        # 3. Вкладка "Торренты игр"
         self.torrents_tab = QWidget()
         self._setup_torrents_ui(self.torrents_tab)
         self.sub_tabs.addTab(self.torrents_tab, "🎮  Игры (qBittorrent)")
@@ -484,7 +501,307 @@ class DownloadsTabWidget(QWidget):
             )
 
     # =========================================================================
-    # ПОДВКЛАДКА 2: QBITTORRENT (ИГРЫ)
+    # ПОДВКЛАДКА 2: УСТАНОВЛЕННЫЕ И СОХРАНЁННЫЕ МОДЫ
+    # =========================================================================
+
+    def _setup_installed_signals(self):
+        installed_mods_manager.mods_updated.connect(self.refresh_installed_mods_table)
+
+    def _setup_installed_mods_ui(self, parent_widget: QWidget):
+        layout = QVBoxLayout(parent_widget)
+        layout.setSpacing(10)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        # Верхняя панель управления
+        top_bar = QHBoxLayout()
+        title_label = QLabel("<b>Реестр установленных и скачанных модов:</b>")
+        title_label.setStyleSheet("font-size: 14px; color: #38bdf8;")
+
+        self.installed_count_badge = QLabel("0 модов")
+        self.installed_count_badge.setStyleSheet(
+            "background-color: #1e293b; color: #94a3b8; padding: 3px 8px; "
+            "border-radius: 10px; font-size: 11px; font-weight: bold;"
+        )
+
+        top_bar.addWidget(title_label)
+        top_bar.addWidget(self.installed_count_badge)
+        top_bar.addStretch(1)
+
+        self.open_installed_folder_btn = QPushButton("📁 Папка модов")
+        self.open_installed_folder_btn.setObjectName("secondaryBtn")
+        self.open_installed_folder_btn.setToolTip("Открыть папку сохранения модов в проводнике")
+        self.open_installed_folder_btn.clicked.connect(self.open_mods_folder)
+        top_bar.addWidget(self.open_installed_folder_btn)
+
+        self.scan_installed_btn = QPushButton("🔍 Сканировать папку")
+        self.scan_installed_btn.setObjectName("secondaryBtn")
+        self.scan_installed_btn.setToolTip("Найти ранее скачанные моды и архивы в папке модов")
+        self.scan_installed_btn.clicked.connect(self.scan_installed_folder)
+        top_bar.addWidget(self.scan_installed_btn)
+
+        self.clean_missing_btn = QPushButton("🧹 Очистить отсутствующие")
+        self.clean_missing_btn.setObjectName("secondaryBtn")
+        self.clean_missing_btn.setToolTip("Убрать из реестра записи модов, удалённых с диска")
+        self.clean_missing_btn.clicked.connect(self.clean_missing_installed_mods)
+        top_bar.addWidget(self.clean_missing_btn)
+
+        layout.addLayout(top_bar)
+
+        # Панель фильтрации
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
+
+        self.installed_search_input = QLineEdit()
+        self.installed_search_input.setPlaceholderText("🔎 Быстрый поиск по названию мода, игре или файлу...")
+        self.installed_search_input.setClearButtonEnabled(True)
+        self.installed_search_input.textChanged.connect(self.refresh_installed_mods_table)
+        filter_row.addWidget(self.installed_search_input, stretch=3)
+
+        self.installed_source_combo = QComboBox()
+        self.installed_source_combo.addItem("Все источники", "")
+        self.installed_source_combo.addItem("🌐 Nexus Mods", "nexus")
+        self.installed_source_combo.addItem("⚡ Steam Workshop", "steam")
+        self.installed_source_combo.currentIndexChanged.connect(self.refresh_installed_mods_table)
+        filter_row.addWidget(self.installed_source_combo, stretch=1)
+
+        self.installed_only_disk_cb = QCheckBox("Только на диске")
+        self.installed_only_disk_cb.setChecked(False)
+        self.installed_only_disk_cb.stateChanged.connect(self.refresh_installed_mods_table)
+        filter_row.addWidget(self.installed_only_disk_cb)
+
+        layout.addLayout(filter_row)
+
+        # Таблица установленных модов
+        self.installed_table = QTableWidget()
+        self.installed_table.setColumnCount(7)
+        self.installed_table.setHorizontalHeaderLabels([
+            "Название мода", "Игра", "Источник", "Размер", "Дата установки", "Статус", "Путь к файлам"
+        ])
+        self.installed_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.installed_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.installed_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.installed_table.verticalHeader().setVisible(False)
+        self.installed_table.horizontalHeader().setStretchLastSection(False)
+        self.installed_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.installed_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.installed_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.installed_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.installed_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.installed_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.installed_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
+        self.installed_table.setColumnWidth(6, 260)
+
+        self.installed_table.itemSelectionChanged.connect(self.on_installed_selection_changed)
+        self.installed_table.cellDoubleClicked.connect(self.on_installed_double_clicked)
+        layout.addWidget(self.installed_table, stretch=1)
+
+        # Нижняя панель действий для выбранного мода
+        bottom_bar = QHBoxLayout()
+        bottom_bar.setSpacing(10)
+
+        self.show_in_explorer_btn = QPushButton("📂 Показать в проводнике")
+        self.show_in_explorer_btn.setObjectName("secondaryBtn")
+        self.show_in_explorer_btn.setEnabled(False)
+        self.show_in_explorer_btn.clicked.connect(self.show_selected_in_explorer)
+        bottom_bar.addWidget(self.show_in_explorer_btn)
+
+        self.delete_installed_btn = QPushButton("🗑️ Удалить с диска")
+        self.delete_installed_btn.setObjectName("dangerBtn")
+        self.delete_installed_btn.setEnabled(False)
+        self.delete_installed_btn.clicked.connect(self.delete_selected_installed_mod)
+        bottom_bar.addWidget(self.delete_installed_btn)
+
+        self.installed_selected_info = QLabel("Выберите мод из таблицы для управления файлами")
+        self.installed_selected_info.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        bottom_bar.addWidget(self.installed_selected_info, stretch=1)
+
+        layout.addLayout(bottom_bar)
+
+    def refresh_installed_mods_table(self):
+        if not hasattr(self, "installed_table"):
+            return
+
+        q = self.installed_search_input.text().strip() if hasattr(self, "installed_search_input") else ""
+        src = self.installed_source_combo.currentData() if hasattr(self, "installed_source_combo") else ""
+        only_disk = self.installed_only_disk_cb.isChecked() if hasattr(self, "installed_only_disk_cb") else False
+
+        mods = installed_mods_manager.get_all(source=src, query=q, only_existing_on_disk=only_disk)
+        self.installed_mods = mods
+        self.installed_table.setRowCount(len(mods))
+
+        total_count = len(installed_mods_manager.get_all())
+        on_disk_count = sum(1 for m in mods if m.get("exists_on_disk"))
+        if hasattr(self, "installed_count_badge"):
+            self.installed_count_badge.setText(f"{len(mods)} из {total_count} модов (на диске: {on_disk_count})")
+        if hasattr(self, "sub_tabs") and self.sub_tabs.count() > 1:
+            self.sub_tabs.setTabText(1, f"💾  Установленные моды ({total_count})")
+
+        for row, m in enumerate(mods):
+            exists = m.get("exists_on_disk", False)
+
+            # Название
+            title_text = m.get("title", "Мод")
+            if m.get("is_collection"):
+                title_text = f"📚 {title_text}"
+            title_item = QTableWidgetItem(title_text)
+            title_item.setData(Qt.ItemDataRole.UserRole, m)
+
+            # Игра
+            g_name = m.get("game_name") or m.get("game_domain") or "—"
+            game_item = QTableWidgetItem(str(g_name))
+
+            # Источник
+            src_str = "Nexus Mods" if m.get("source") == "nexus" else "Steam Workshop"
+            source_item = QTableWidgetItem(src_str)
+            source_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            # Размер
+            size_item = QTableWidgetItem(m.get("size_human", "—"))
+            size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            # Дата
+            date_item = QTableWidgetItem(m.get("installed_at", "—"))
+            date_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            # Статус
+            if exists:
+                status_item = QTableWidgetItem("✅ На диске")
+                status_item.setForeground(QColor("#22c55e"))
+            else:
+                status_item = QTableWidgetItem("⚠️ Отсутствует")
+                status_item.setForeground(QColor("#ef4444"))
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            # Путь
+            path_item = QTableWidgetItem(m.get("install_path", "—"))
+            path_item.setToolTip(m.get("install_path", ""))
+
+            self.installed_table.setItem(row, 0, title_item)
+            self.installed_table.setItem(row, 1, game_item)
+            self.installed_table.setItem(row, 2, source_item)
+            self.installed_table.setItem(row, 3, size_item)
+            self.installed_table.setItem(row, 4, date_item)
+            self.installed_table.setItem(row, 5, status_item)
+            self.installed_table.setItem(row, 6, path_item)
+
+        self.on_installed_selection_changed()
+
+    def on_installed_selection_changed(self):
+        selected_rows = self.installed_table.selectionModel().selectedRows() if hasattr(self, "installed_table") else []
+        if not selected_rows:
+            self.selected_installed_mod = None
+            if hasattr(self, "show_in_explorer_btn"):
+                self.show_in_explorer_btn.setEnabled(False)
+            if hasattr(self, "delete_installed_btn"):
+                self.delete_installed_btn.setEnabled(False)
+            if hasattr(self, "installed_selected_info"):
+                self.installed_selected_info.setText("Выберите мод из таблицы для управления файлами")
+            return
+
+        row = selected_rows[0].row()
+        item = self.installed_table.item(row, 0)
+        if item:
+            self.selected_installed_mod = item.data(Qt.ItemDataRole.UserRole)
+            m = self.selected_installed_mod
+            p = m.get("install_path", "")
+            exists = m.get("exists_on_disk", False)
+            status_text = "на диске" if exists else "файл не найден"
+
+            if hasattr(self, "show_in_explorer_btn"):
+                self.show_in_explorer_btn.setEnabled(bool(p and exists))
+            if hasattr(self, "delete_installed_btn"):
+                self.delete_installed_btn.setEnabled(True)
+            if hasattr(self, "installed_selected_info"):
+                self.installed_selected_info.setText(f"<b>{m.get('title')}</b> — {status_text}: {p}")
+
+    def on_installed_double_clicked(self, row: int, column: int):
+        self.show_selected_in_explorer()
+
+    def show_selected_in_explorer(self):
+        mod = self.selected_installed_mod
+        if not mod:
+            return
+        path = mod.get("install_path")
+        if not path:
+            return
+        clean = os.path.abspath(path)
+        if os.name == "nt":
+            if os.path.exists(clean):
+                subprocess.run(f'explorer /select,"{clean}"', shell=True)
+            else:
+                QMessageBox.warning(self, "Внимание", f"Файл не найден по пути:\n{clean}")
+        else:
+            if os.path.exists(clean):
+                import webbrowser
+                parent = os.path.dirname(clean) if os.path.isfile(clean) else clean
+                webbrowser.open(parent)
+
+    def delete_selected_installed_mod(self):
+        mod = self.selected_installed_mod
+        if not mod:
+            return
+        title = mod.get("title", "Мод")
+        path = mod.get("install_path", "")
+        key = mod.get("key") or mod.get("mod_id")
+
+        reply = QMessageBox.question(
+            self,
+            "Удаление мода",
+            f"Вы уверены, что хотите удалить мод:\n\n<b>{title}</b>\n\n"
+            f"Файлы на диске ({path}) будут безвозвратно удалены.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            success, msg = installed_mods_manager.unregister_mod(key, delete_files=True)
+            if not success and msg:
+                QMessageBox.warning(self, "Предупреждение", f"Не удалось полностью удалить файлы: {msg}")
+            self.refresh_installed_mods_table()
+
+    def scan_installed_folder(self):
+        folder = None
+        if self.get_mods_folder_callback:
+            folder = self.get_mods_folder_callback()
+        if not folder or not os.path.isdir(folder):
+            from PyQt6.QtCore import QSettings
+            folder = QSettings("SBSH", "SteamWorkshopLauncher").value("mods_folder", "")
+
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.warning(self, "Внимание", "Папка модов не указана или не существует. Настройте путь во вкладке 'Настройки'.")
+            return
+
+        added = installed_mods_manager.scan_directory(folder)
+        if added > 0:
+            QMessageBox.information(
+                self,
+                "Сканирование завершено",
+                f"Найдено и добавлено в реестр ранее скачанных модов: {added}"
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Сканирование завершено",
+                "Новых модов или архивов в папке не обнаружено. Все найденные файлы уже учтены."
+            )
+        self.refresh_installed_mods_table()
+
+    def clean_missing_installed_mods(self):
+        removed = installed_mods_manager.clean_missing()
+        if removed > 0:
+            QMessageBox.information(
+                self,
+                "Очистка реестра",
+                f"Удалено {removed} записей о модах, файлы которых отсутствуют на диске."
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Очистка реестра",
+                "Все зарегистрированные моды присутствуют на диске. Очистка не требуется."
+            )
+        self.refresh_installed_mods_table()
+
+    # =========================================================================
+    # ПОДВКЛАДКА 3: QBITTORRENT (ИГРЫ)
     # =========================================================================
 
     def _setup_torrents_ui(self, parent_widget: QWidget):
