@@ -236,8 +236,50 @@ class DownloadQueueManager(QObject):
         game_domain: str,
         save_dir: str,
         size_human: str = "—",
+        force: bool = False,
     ) -> DownloadTask:
-        """Добавляет файл Nexus Mods в очередь загрузки."""
+        """Добавляет файл Nexus Mods в очередь загрузки со сверкой наличия и блокировкой дублей."""
+        from modules.downloaded_mods import downloaded_mods_manager
+
+        if not force:
+            is_dl, dl_data = downloaded_mods_manager.is_downloaded(
+                source="nexus",
+                mod_id=mod_id,
+                file_id=file_id,
+                filename=file_name,
+                game_id=game_id,
+                title=title,
+            )
+            if is_dl and dl_data:
+                existing_p = dl_data.get("filepath", "")
+                with self._lock:
+                    tid = self._next_id
+                    self._next_id += 1
+                    task = DownloadTask(
+                        task_id=tid,
+                        source="nexus",
+                        mod_id=mod_id,
+                        file_id=file_id,
+                        title=title or f"Mod #{mod_id}",
+                        file_name=file_name or os.path.basename(existing_p),
+                        size_human=size_human or "—",
+                        game_id=game_id,
+                        game_domain=game_domain,
+                        save_dir=save_dir,
+                        status=STATE_COMPLETED,
+                        status_text="Уже скачан",
+                        progress=100,
+                        speed_str="—",
+                        saved_path=existing_p,
+                    )
+                    self._tasks.append(task)
+                    self._tasks_by_id[tid] = task
+                    self.save_history()
+                    self.task_added.emit(task)
+                    self.task_finished.emit(task.task_id, True, existing_p)
+                    self._notify_active_count()
+                    return task
+
         with self._lock:
             tid = self._next_id
             self._next_id += 1
@@ -271,8 +313,46 @@ class DownloadQueueManager(QObject):
         save_dir: str,
         steamcmd_path: str,
         size_human: str = "—",
+        force: bool = False,
     ) -> DownloadTask:
-        """Добавляет мод Steam Workshop в очередь загрузки."""
+        """Добавляет мод Steam Workshop в очередь загрузки со сверкой наличия."""
+        from modules.downloaded_mods import downloaded_mods_manager
+
+        if not force:
+            is_dl, dl_data = downloaded_mods_manager.is_downloaded(
+                source="steam",
+                mod_id=mod_id,
+                title=title,
+            )
+            if is_dl and dl_data:
+                existing_p = dl_data.get("filepath", "")
+                with self._lock:
+                    tid = self._next_id
+                    self._next_id += 1
+                    task = DownloadTask(
+                        task_id=tid,
+                        source="steam",
+                        appid=appid,
+                        mod_id=mod_id,
+                        title=title or f"Workshop #{mod_id}",
+                        file_name=f"Workshop #{mod_id}",
+                        size_human=size_human or "—",
+                        save_dir=save_dir,
+                        steamcmd_path=steamcmd_path,
+                        status=STATE_COMPLETED,
+                        status_text="Уже скачан",
+                        progress=100,
+                        speed_str="—",
+                        saved_path=existing_p,
+                    )
+                    self._tasks.append(task)
+                    self._tasks_by_id[tid] = task
+                    self.save_history()
+                    self.task_added.emit(task)
+                    self.task_finished.emit(task.task_id, True, existing_p)
+                    self._notify_active_count()
+                    return task
+
         with self._lock:
             tid = self._next_id
             self._next_id += 1

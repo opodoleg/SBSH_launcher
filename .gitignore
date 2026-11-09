@@ -10,5 +10,7 @@ downloads/
 favorites.json
 installed_mods.json
 saved_games.json
+download_history.json
+downloaded_mods.json
 *.log
 

@@ -30,6 +30,7 @@ hiddenimports = [
     'modules.saved_games',
     'modules.download_queue',
     'modules.installed_mods',
+    'modules.downloaded_mods',
     'modules.download_router',
     'ui',
     'ui.styles',

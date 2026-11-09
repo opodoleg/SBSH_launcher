@@ -181,6 +181,13 @@ class SBSHLauncher(QMainWindow):
         self.queue_manager = get_download_queue_manager()
         self.queue_manager.active_count_changed.connect(self._on_download_active_count_changed)
 
+        # Актуализация локальной базы скачанных модов
+        try:
+            from modules.downloaded_mods import downloaded_mods_manager
+            downloaded_mods_manager.scan_mods_folder()
+        except Exception as e:
+            print(f"[Launcher] Ошибка инициализации downloaded_mods: {e}")
+
     def _on_download_active_count_changed(self, count: int):
         tab_idx = 3
         if count > 0:
