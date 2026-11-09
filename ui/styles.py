@@ -177,6 +177,12 @@ QPushButton:disabled {
     color: #64748b;
 }
 
+QPushButton:checked {
+    background-color: #38bdf8;
+    color: #0f172a;
+    font-weight: bold;
+}
+
 /* Второстепенные кнопки */
 QPushButton#secondaryBtn {
     background-color: #2a2c3a;

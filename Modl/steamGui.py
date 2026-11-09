@@ -769,6 +769,7 @@ class SteamSearchUI(QWidget):
 
         nexus_type_layout.addWidget(self.btn_view_mods, stretch=1)
         nexus_type_layout.addWidget(self.btn_view_collections, stretch=1)
+        self._update_nexus_type_buttons_style()
         self.nexus_type_container.setVisible(False)
 
         # Блок выбора категории Nexus Mods (виден только в режиме Nexus -> Моды)
@@ -1088,6 +1089,21 @@ class SteamSearchUI(QWidget):
     # ПЕРЕКЛЮЧЕНИЕ ИСТОЧНИКА (STEAM / NEXUS)
     # ==========================================
 
+    def _update_nexus_type_buttons_style(self):
+        is_mods = (getattr(self, "nexus_type", "mods") == "mods")
+        active_style = (
+            "QPushButton { background-color: #38bdf8; color: #0f172a; font-weight: bold; "
+            "border: 1px solid #38bdf8; border-radius: 6px; padding: 7px 14px; font-size: 12px; }"
+        )
+        inactive_style = (
+            "QPushButton { background-color: #22232e; color: #94a3b8; font-weight: normal; "
+            "border: 1px solid #3b3e52; border-radius: 6px; padding: 7px 14px; font-size: 12px; } "
+            "QPushButton:hover { background-color: #2d3040; color: #f1f2f8; }"
+        )
+        if hasattr(self, "btn_view_mods") and hasattr(self, "btn_view_collections"):
+            self.btn_view_mods.setStyleSheet(active_style if is_mods else inactive_style)
+            self.btn_view_collections.setStyleSheet(inactive_style if is_mods else active_style)
+
     def set_nexus_type(self, type_name: str):
         """Переключает режим отображения между одиночными модами и коллекциями."""
         if type_name == getattr(self, "nexus_type", "mods"):
@@ -1095,6 +1111,7 @@ class SteamSearchUI(QWidget):
         self.nexus_type = type_name
         self.btn_view_mods.setChecked(type_name == "mods")
         self.btn_view_collections.setChecked(type_name == "collections")
+        self._update_nexus_type_buttons_style()
 
         self.mods_list.clear()
         self.mod_search_input.clear()
