@@ -344,46 +344,79 @@ class InstalledModsManager(QObject):
         game_id: Any = None,
         title: Optional[str] = None,
         check_disk: bool = True,
+        file_id: Optional[Any] = None,
+        **kwargs,
     ) -> Tuple[bool, Optional[Dict[str, Any]]]:
         """
         Проверяет, установлен ли данный мод.
-        Проверяет совпадение по mod_id, а также по нормализованному названию (title).
+        Проверяет совпадение по mod_id, file_id, а также по нормализованному названию (title).
         Возвращает (True, entry), если мод зарегистрирован и файл существует на диске.
         """
-        mid_str = str(mod_id).strip() if mod_id is not None else ""
+        mid_str = str(mod_id).strip() if mod_id is not None and str(mod_id).strip() not in ["", "None", "0"] else ""
+        fid_str = str(file_id).strip() if file_id is not None and str(file_id).strip() not in ["", "None", "0"] else ""
         src_clean = (source or "").strip().lower()
-        gid_str = str(game_id).strip() if game_id is not None else ""
+        gid_str = str(game_id).strip() if game_id is not None and str(game_id).strip() not in ["", "None", "0"] else ""
         norm_req_title = normalize_mod_key(title) if title else ""
 
         with self._lock:
+            fallback_match: Optional[Dict[str, Any]] = None
+
             for m in self._mods:
                 if src_clean and m.get("source", "").lower() != src_clean:
                     continue
 
-                matched = False
-                if mid_str and str(m.get("mod_id", "")).strip() == mid_str:
-                    matched = True
+                if gid_str and m.get("game_id") is not None and str(m.get("game_id")).strip() != gid_str:
+                    continue
+
+                entry_mid = str(m.get("mod_id", "")).strip()
+                entry_fid = str(m.get("file_id", "")).strip() if m.get("file_id") is not None else ""
+                if entry_fid in ["None", "0"]:
+                    entry_fid = ""
+
+                # Проверка точного совпадения по file_id
+                if fid_str and entry_fid and fid_str == entry_fid:
+                    if not mid_str or entry_mid == mid_str:
+                        return self._check_entry_disk(m, check_disk)
+
+                # Проверка по mod_id
+                if mid_str and entry_mid == mid_str:
+                    if fid_str and entry_fid and fid_str != entry_fid:
+                        # У мода зарегистрирован другой file_id — сохраняем как резервный кандидат
+                        if fallback_match is None:
+                            fallback_match = m
+                    else:
+                        return self._check_entry_disk(m, check_disk)
+
+                # Проверка по нормализованному названию
                 elif norm_req_title:
                     entry_title = normalize_mod_key(m.get("title", ""))
                     entry_fname = normalize_mod_key(m.get("file_name", ""))
                     if norm_req_title == entry_title or norm_req_title == entry_fname:
-                        matched = True
+                        if fallback_match is None:
+                            fallback_match = m
 
-                if not matched:
-                    continue
-
-                if gid_str and m.get("game_id") is not None:
-                    if str(m.get("game_id")).strip() != gid_str:
-                        continue
-
-                path = m.get("install_path", "")
-                if check_disk:
-                    if path and os.path.exists(path):
-                        return True, dict(m)
-                    return False, dict(m)
-                return True, dict(m)
+            if fallback_match is not None:
+                return self._check_entry_disk(fallback_match, check_disk)
 
         return False, None
+
+    def _check_entry_disk(self, m: Dict[str, Any], check_disk: bool) -> Tuple[bool, Dict[str, Any]]:
+        """Проверяет физическое наличие файлов мода на диске."""
+        if not check_disk:
+            return True, dict(m)
+
+        path = m.get("install_path", "")
+        if path and os.path.exists(path):
+            return True, dict(m)
+
+        # Проверка извлечённых файлов мода (если мод был распакован в game_root)
+        extracted = m.get("extracted_files", [])
+        g_root = m.get("game_root", "")
+        if extracted and g_root and os.path.isdir(g_root):
+            if any(os.path.exists(os.path.join(g_root, rel)) for rel in extracted):
+                return True, dict(m)
+
+        return False, dict(m)
 
     def get_all(
         self,
