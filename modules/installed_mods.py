@@ -206,10 +206,13 @@ class InstalledModsManager(QObject):
         size_human: str = "—",
         mod_type: str = MOD_TYPE_UNKNOWN,
         is_collection: bool = False,
+        extracted_files: Optional[List[str]] = None,
+        game_root: str = "",
     ) -> Dict[str, Any]:
         """
         Регистрирует скачанный или обнаруженный установленный мод.
         Если мод уже был зарегистрирован, обновляет данные, тип и путь.
+        Поддерживает сохранение списка извлечённых относительных путей для отслеживания и удаления.
         """
         with self._lock:
             key = self.make_mod_key(source, mod_id, file_id)
@@ -245,6 +248,10 @@ class InstalledModsManager(QObject):
                     entry["size_human"] = size_human
                 if mod_type and mod_type != MOD_TYPE_UNKNOWN:
                     entry["mod_type"] = mod_type
+                if extracted_files:
+                    entry["extracted_files"] = list(extracted_files)
+                if game_root:
+                    entry["game_root"] = os.path.abspath(game_root)
                 entry["is_collection"] = is_collection
                 entry["updated_at"] = now_str
             else:
@@ -263,6 +270,8 @@ class InstalledModsManager(QObject):
                     "install_path": clean_path,
                     "file_name": file_name or (os.path.basename(clean_path) if clean_path else ""),
                     "is_collection": is_collection,
+                    "extracted_files": list(extracted_files or []),
+                    "game_root": os.path.abspath(game_root) if game_root else "",
                     "installed_at": now_str,
                     "updated_at": now_str,
                 }
@@ -276,7 +285,8 @@ class InstalledModsManager(QObject):
 
     def unregister_mod(self, key_or_id: str, delete_files: bool = False) -> Tuple[bool, str]:
         """
-        Удаляет мод из реестра и опционально стирает файлы/папку с диска.
+        Удаляет мод из реестра и опционально стирает файлы/папку с диска,
+        включая точечное удаление всех извлечённых в игру файлов (extracted_files).
         """
         with self._lock:
             found_idx = -1
@@ -293,14 +303,28 @@ class InstalledModsManager(QObject):
 
             path = target_entry.get("install_path")
             err_msg = ""
-            if delete_files and path and os.path.exists(path):
-                try:
-                    if os.path.isdir(path):
-                        shutil.rmtree(path)
-                    else:
-                        os.remove(path)
-                except Exception as e:
-                    err_msg = f"Не удалось удалить файлы с диска: {e}"
+            if delete_files:
+                # 1. Удаление всех извлечённых файлов из директории игры
+                extracted = target_entry.get("extracted_files", [])
+                g_root = target_entry.get("game_root", "")
+                if extracted and g_root and os.path.isdir(g_root):
+                    for rel_p in extracted:
+                        abs_p = os.path.join(g_root, rel_p)
+                        if os.path.isfile(abs_p):
+                            try:
+                                os.remove(abs_p)
+                            except Exception as e:
+                                err_msg = f"Ошибка удаления файла {rel_p}: {e}"
+
+                # 2. Удаление основного архива или папки мода
+                if path and os.path.exists(path):
+                    try:
+                        if os.path.isdir(path):
+                            shutil.rmtree(path)
+                        else:
+                            os.remove(path)
+                    except Exception as e:
+                        err_msg = f"Не удалось удалить файлы с диска: {e}"
 
             self._mods.pop(found_idx)
             self.save()
@@ -435,6 +459,75 @@ class InstalledModsManager(QObject):
             custom_dirs=custom_dirs,
             log_callback=log_callback,
         )
+
+    def get_default_game_dir(self) -> str:
+        """Определяет директорию игры из настроек или известных расположений."""
+        try:
+            from PyQt6.QtCore import QSettings
+            st = QSettings("SBSH", "Launcher")
+            for k in ["games_save_path", "cyberpunk_path", "game_path", "game_dir"]:
+                v = st.value(k, "")
+                if v and isinstance(v, str) and os.path.isdir(v):
+                    return os.path.abspath(v)
+        except Exception:
+            pass
+
+        known_paths = [
+            r"G:\games\Cyberpunk 2077",
+            r"C:\Games\Cyberpunk 2077",
+            r"D:\Games\Cyberpunk 2077",
+            r"C:\Program Files (x86)\Steam\steamapps\common\Cyberpunk 2077",
+            r"D:\SteamLibrary\steamapps\common\Cyberpunk 2077",
+            r"C:\GOG Games\Cyberpunk 2077",
+        ]
+        for p in known_paths:
+            if os.path.isdir(p):
+                return os.path.abspath(p)
+
+        return os.path.join(get_base_dir(), "Cyberpunk 2077")
+
+    def extract_and_route_mod(
+        self,
+        archive_path: str,
+        game_root: Optional[str] = None,
+        source: str = "nexus",
+        mod_id: Any = None,
+        title: str = "",
+        file_id: Any = None,
+        version: str = "",
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    ):
+        """
+        Распаковывает архив мода с интеллектуальной маршрутизацией (.archive, .reds, .yaml, r6, bin, mods)
+        в директорию игры и регистрирует извлечённые файлы в реестре для отслеживания и удаления.
+        """
+        from modules.mod_extractor import mod_archive_extractor
+        effective_root = game_root or self.get_default_game_dir()
+        result = mod_archive_extractor.extract_mod_archive(
+            archive_path=archive_path,
+            game_root=effective_root,
+            progress_cb=progress_cb,
+        )
+        if result.success:
+            m_title = title or os.path.splitext(os.path.basename(archive_path))[0]
+            m_id = mod_id or m_title
+            sz_human = format_size(os.path.getsize(archive_path)) if os.path.isfile(archive_path) else "—"
+
+            self.register_mod(
+                source=source,
+                mod_id=m_id,
+                title=m_title,
+                install_path=archive_path,
+                game_name="Cyberpunk 2077",
+                file_id=file_id,
+                file_name=os.path.basename(archive_path),
+                version=version,
+                size_human=sz_human,
+                mod_type=MOD_TYPE_PACKAGE,
+                extracted_files=result.extracted_relative_paths,
+                game_root=effective_root,
+            )
+        return result
 
     # =========================================================================
     # СКАНИРОВАНИЕ И СИНХРОНИЗАЦИЯ ИГРОВЫХ ДИРЕКТОРИЙ

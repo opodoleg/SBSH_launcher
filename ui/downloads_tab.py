@@ -877,6 +877,13 @@ class DownloadsTabWidget(QWidget):
         self.show_in_explorer_btn.clicked.connect(self.show_selected_in_explorer)
         bottom_bar.addWidget(self.show_in_explorer_btn)
 
+        self.extract_to_game_btn = QPushButton("📦 Установить архив в игру")
+        self.extract_to_game_btn.setObjectName("accentBtn")
+        self.extract_to_game_btn.setToolTip("Интеллектуальная распаковка и маршрутизация архива (.zip, .7z, .rar) по папкам игры (r6, archive, bin, mods)")
+        self.extract_to_game_btn.setEnabled(False)
+        self.extract_to_game_btn.clicked.connect(self.extract_selected_archive_to_game)
+        bottom_bar.addWidget(self.extract_to_game_btn)
+
         self.delete_installed_btn = QPushButton("🗑️ Удалить с диска")
         self.delete_installed_btn.setObjectName("dangerBtn")
         self.delete_installed_btn.setEnabled(False)
@@ -989,6 +996,8 @@ class DownloadsTabWidget(QWidget):
             self.selected_installed_mod = None
             if hasattr(self, "show_in_explorer_btn"):
                 self.show_in_explorer_btn.setEnabled(False)
+            if hasattr(self, "extract_to_game_btn"):
+                self.extract_to_game_btn.setEnabled(False)
             if hasattr(self, "delete_installed_btn"):
                 self.delete_installed_btn.setEnabled(False)
             if hasattr(self, "installed_selected_info"):
@@ -1004,8 +1013,11 @@ class DownloadsTabWidget(QWidget):
             exists = m.get("exists_on_disk", False)
             status_text = "на диске" if exists else "файл не найден"
 
+            is_archive = bool(p and p.lower().endswith((".zip", ".7z", ".rar", ".tar", ".gz")))
             if hasattr(self, "show_in_explorer_btn"):
                 self.show_in_explorer_btn.setEnabled(bool(p and exists))
+            if hasattr(self, "extract_to_game_btn"):
+                self.extract_to_game_btn.setEnabled(bool(p and exists and is_archive))
             if hasattr(self, "delete_installed_btn"):
                 self.delete_installed_btn.setEnabled(True)
             if hasattr(self, "installed_selected_info"):
@@ -1032,6 +1044,56 @@ class DownloadsTabWidget(QWidget):
                 import webbrowser
                 parent = os.path.dirname(clean) if os.path.isfile(clean) else clean
                 webbrowser.open(parent)
+
+    def extract_selected_archive_to_game(self):
+        """Интеллектуальная распаковка и маршрутизация архива в директорию игры."""
+        mod = self.selected_installed_mod
+        if not mod:
+            return
+        p = mod.get("install_path")
+        if not p or not os.path.isfile(p):
+            QMessageBox.warning(self, "Ошибка", "Файл архива не найден на диске.")
+            return
+
+        st = QSettings("SBSH", "Launcher")
+        game_root = st.value("games_save_path", "") or installed_mods_manager.get_default_game_dir()
+        if not game_root or not os.path.isdir(game_root):
+            game_root = QFileDialog.getExistingDirectory(
+                self,
+                "Выберите директорию установки Cyberpunk 2077",
+                os.getcwd()
+            )
+            if not game_root:
+                return
+
+        res = installed_mods_manager.extract_and_route_mod(
+            archive_path=p,
+            game_root=game_root,
+            source=mod.get("source", "nexus"),
+            mod_id=mod.get("mod_id"),
+            title=mod.get("title", ""),
+            file_id=mod.get("file_id"),
+            version=mod.get("version", ""),
+        )
+
+        if res.success:
+            sample_files = "\n".join(f"  • {f}" for f in res.extracted_relative_paths[:10])
+            if len(res.extracted_relative_paths) > 10:
+                sample_files += f"\n  ... и ещё {len(res.extracted_relative_paths) - 10} файлов"
+
+            wrap_info = f"Снята папка-обёртка: {res.wrapper_folder}\n" if res.is_wrapped else ""
+            msg = (
+                f"✅ Мод успешно распакован и установлен в игру!\n\n"
+                f"📂 Директория игры: {game_root}\n"
+                f"📄 Всего извлечено файлов: {res.total_files_extracted}\n"
+                f"{wrap_info}"
+                f"\nИзвлечённые файлы:\n{sample_files}"
+            )
+            QMessageBox.information(self, "Установка мода завершена", msg)
+        else:
+            QMessageBox.critical(self, "Ошибка установки", f"Не удалось распаковать мод:\n{res.error_message}")
+
+        self.refresh_installed_mods_table()
 
     def delete_selected_installed_mod(self):
         mod = self.selected_installed_mod
