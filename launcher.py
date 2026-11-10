@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
 from ui.downloads_tab import DownloadsTabWidget
 from ui.favorites_tab import FavoritesTabWidget
 from ui.games_tab import GamesTabWidget
+from ui.mod_packs_tab import ModPacksTabWidget
 from ui.mods_tab import ModsTabWidget
 from ui.settings_tab import SettingsTabWidget
 from ui.styles import DARK_THEME_QSS
@@ -139,11 +140,15 @@ class SBSHLauncher(QMainWindow):
         )
         self.tabs.addTab(self.mods_tab, "🔧  Мастерская модов")
 
-        # 3. Вкладка избранных игр
+        # 3. Вкладка кастомных мод-паков (Коллекции)
+        self.mod_packs_tab = ModPacksTabWidget(get_mods_folder_callback=self.get_mods_folder)
+        self.tabs.addTab(self.mod_packs_tab, "📦  Мод-паки")
+
+        # 4. Вкладка избранных игр
         self.favorites_tab = FavoritesTabWidget(get_games_save_path_callback=self.get_games_save_path)
         self.tabs.addTab(self.favorites_tab, "⭐  Избранное")
 
-        # 4. Вкладка загрузок (Моды и qBittorrent)
+        # 5. Вкладка загрузок (Моды и qBittorrent)
         self.downloads_tab = DownloadsTabWidget(
             get_qb_url_callback=self.get_qb_url,
             get_mods_folder_callback=self.get_mods_folder

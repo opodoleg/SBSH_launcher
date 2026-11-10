@@ -952,6 +952,12 @@ class ModsTabWidget(QWidget):
         self.delete_installed_mod_btn.setVisible(False)
         self.delete_installed_mod_btn.clicked.connect(self.delete_current_installed_mod)
 
+        self.add_to_pack_btn = QPushButton("📦 В мод-пак...")
+        self.add_to_pack_btn.setObjectName("secondaryBtn")
+        self.add_to_pack_btn.setToolTip("Добавить этот мод в пользовательский мод-пак")
+        self.add_to_pack_btn.setEnabled(False)
+        self.add_to_pack_btn.clicked.connect(self.add_current_mod_to_pack)
+
         self.download_button = QPushButton("⚡ Скачать выбранный мод через SteamCMD")
         self.download_button.setObjectName("accentBtn")
         self.download_button.setFixedHeight(36)
@@ -961,6 +967,7 @@ class ModsTabWidget(QWidget):
         actions_row.addWidget(self.browser_button)
         actions_row.addWidget(self.open_installed_folder_btn)
         actions_row.addWidget(self.delete_installed_mod_btn)
+        actions_row.addWidget(self.add_to_pack_btn)
         actions_row.addWidget(self.download_button, stretch=1)
         details_layout.addWidget(self.single_mod_actions_container)
 
@@ -1996,6 +2003,7 @@ class ModsTabWidget(QWidget):
                 self.description_box.setVisible(True)
                 self.download_button.setEnabled(True)
                 self.browser_button.setEnabled(True)
+                self.add_to_pack_btn.setEnabled(True)
 
                 if has_mod and effective_data:
                     p = effective_data.get("filepath") or effective_data.get("install_path", "")
@@ -2022,6 +2030,7 @@ class ModsTabWidget(QWidget):
                 self.screenshots_box.setVisible(False)
                 self.download_button.setEnabled(False)
                 self.browser_button.setEnabled(False)
+                self.add_to_pack_btn.setEnabled(False)
                 self.installed_badge.setVisible(False)
                 self.open_installed_folder_btn.setVisible(False)
                 self.delete_installed_mod_btn.setVisible(False)
@@ -2050,6 +2059,7 @@ class ModsTabWidget(QWidget):
             )
             self.download_button.setEnabled(True)
             self.browser_button.setEnabled(True)
+            self.add_to_pack_btn.setEnabled(True)
 
             if has_mod and effective_data:
                 p = effective_data.get("filepath") or effective_data.get("install_path", "")
@@ -2076,6 +2086,7 @@ class ModsTabWidget(QWidget):
             self.screenshots_box.setVisible(False)
             self.download_button.setEnabled(False)
             self.browser_button.setEnabled(False)
+            self.add_to_pack_btn.setEnabled(False)
             self.installed_badge.setVisible(False)
             self.open_installed_folder_btn.setVisible(False)
             self.delete_installed_mod_btn.setVisible(False)
@@ -2709,8 +2720,49 @@ class ModsTabWidget(QWidget):
         self.status_label.setText(f"Ошибка сети: {error_message}")
 
     # ==========================================
-    # СКАЧИВАНИЕ МОДА
+    # СКАЧИВАНИЕ МОДА И ДОБАВЛЕНИЕ В МОД-ПАК
     # ==========================================
+
+    def add_current_mod_to_pack(self):
+        """Открывает диалог добавления текущего выбранного мода в кастомный мод-пак."""
+        if not self.current_mod:
+            QMessageBox.warning(self, "Предупреждение", "Пожалуйста, выберите мод из списка.")
+            return
+
+        from ui.mod_packs_tab import AddCurrentModToPackDialog
+        mod_info = {}
+        if self.source_mode == "nexus":
+            m_id = self.current_mod.get("mod_id")
+            title = self.current_mod.get("name") or self.current_mod.get("title", f"Мод #{m_id}")
+            domain = self.current_nexus_game.get("domain", "cyberpunk2077")
+            g_id = self.current_nexus_game.get("game_id", 3333)
+            version = self.current_mod.get("version", "")
+            f_id = self.selected_nexus_file.get("file_id") if self.selected_nexus_file else None
+            f_name = self.selected_nexus_file.get("file_name", "") if self.selected_nexus_file else ""
+
+            mod_info = {
+                "source": "nexus",
+                "mod_id": m_id,
+                "title": title,
+                "game_domain": domain,
+                "game_id": g_id,
+                "version": version,
+                "file_id": f_id,
+                "file_name": f_name,
+                "category": self.current_mod.get("category", ""),
+            }
+        else:
+            mod_id = self.current_mod.get("publishedfileid") or self.current_mod.get("id")
+            title = self.current_mod.get("title", f"Мод Workshop #{mod_id}")
+            mod_info = {
+                "source": "steam",
+                "mod_id": mod_id,
+                "title": title,
+                "game_id": self.current_appid,
+            }
+
+        dlg = AddCurrentModToPackDialog(mod_info, parent=self)
+        dlg.exec()
 
     def download_selected_mod(self):
         if not self.current_mod:
